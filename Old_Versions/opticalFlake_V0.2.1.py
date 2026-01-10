@@ -8,6 +8,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import math
+import platform
+import sys
 
 # USAGE INSTRUCTIONS
 # Position window over relevant image
@@ -32,9 +34,17 @@ def create_transparent_window():
     window_height = 1000
     root.geometry(f"{window_width}x{window_height}")
 
-    # Make the window background transparent
-    transparent_color = root["bg"]
-    root.attributes("-transparentcolor", transparent_color)
+    # Make the window background transparent (platform-specific)
+    transparent_color = "white"  # Use a specific color for Windows
+    root.configure(bg=transparent_color)
+    
+    # Handle platform-specific transparency
+    system = platform.system()
+    if system == "Windows":
+        root.attributes("-transparentcolor", transparent_color)
+    # On macOS, tkinter doesn't support color-based transparency like Windows
+    # The window will show with a white background, but you can still position it over your image
+    # On Linux, transparency handling varies by window manager
 
     # Create a canvas to draw on
     canvas = tk.Canvas(root, width=window_width, height=window_height, bg=transparent_color, highlightthickness=0)

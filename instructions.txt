@@ -1,0 +1,38 @@
+Version V0.3 will be a complete rewrite that won't necessarily use the same libraries. 
+Currently the transparency behavior is broken on MacOS and in general the program is cludgy and poor quality.
+
+Update # copilot-instructions to reflect all of this. Remove specific details to the old implementation which are irrelevant
+
+ 
+Desired Behavior & Structure:
+1 Overall Program window
+2 Main Sections
+- Control toolbar: At top
+- Image & Data Display (Multi-tabbed section) (1 Image with 1 Data section per a tab): Image on left, data on right
+-- Subsection to data display: Scrollable list of each set of measurements for managing co-plotted measurements
+The program should support multiple images and measurements through the use of tabs.
+
+Control Toolbar:
+ - 'Capture Image' button
+ -- When clicked the user will then click and drag for a screenshot with similar behavior to the snip tool
+ -- It should open a new 'Image' tab with the screenshot which will then be drawn on to define background region, linecut(s) etc
+ - Clear Screenshot will be deprecated as instead tabs will just be opened and closed
+ -- Data windows should be calculated at creation such that the associated image can be closed with no effect to the data display
+ - 'Draw Background' button
+ -- Click vertices and then double click for the final vertex
+ -- As it is drawn the vertices and lines should be previewed
+ -- Upon completion, the average RGB should be printed in small text in the corner of the image
+ - 'Draw Linecut' button
+ -- The user will click once on the image to set the starting point which will be marked. A potential line will be drawn to the user's cursor.
+ When the next click/double click is made, the next point will be set.
+ A double click ends the linecut selection while clicks can be daisy chained into multiple connected line segments.
+ - 'Width' field: This is the width of the parallel region to the linecut which will be used for averaging.
+ -- The width should be plotted and previewed with the linecut.
+ -- The width at the time of creation is associated with the plotted data.
+
+Data Display Section:
+ - When the user double clicks to end the linecut, the 3 RGB channels should be plotted in the data section.
+ -- Additional 'Draw Linecut' on the same image should be added to the same data section and coplotted with the other measurements
+ -- There will be scrollable list of the measurements which will have an editable field of the width value for that measurement and an x for removing that measurement
+
+ The contrast range is generally small <10%.
