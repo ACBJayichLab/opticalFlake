@@ -68,6 +68,7 @@ class ImageTab:
 
 # Testing and Validation
 - Test unit chunks to verify functionality as the project grows.
+- Always validate outputs against expected results.
 
 ## File Structure
 - `opticalFlake_V0.3.py` - Current main implementation (PySide6 rewrite)
