@@ -1541,13 +1541,20 @@ class MainWindow(QMainWindow):
         self.capture_btn.clicked.connect(self._start_capture)
         self.toolbar.addWidget(self.capture_btn)
         
-        self.toolbar.addSeparator()
+        # Spacer after Capture button - ADJUST THIS VALUE to tune spacing before Draw Background
+        capture_spacer = QWidget()
+        capture_spacer.setFixedWidth(2)  # <-- TUNE THIS: pixels of space before Draw Background
+        self.toolbar.addWidget(capture_spacer)
         
         # Draw Background button
         self.bg_btn = QPushButton("Draw Background")
         self.bg_btn.clicked.connect(self._start_background)
         self.bg_btn.setEnabled(False)
         self.toolbar.addWidget(self.bg_btn)
+        
+        background_spacer = QWidget()
+        background_spacer.setFixedWidth(4)  # <-- TUNE THIS: pixels of space before Draw Background
+        self.toolbar.addWidget(background_spacer)
         
         # Draw Linecut button
         self.linecut_btn = QPushButton("Draw Linecut")
