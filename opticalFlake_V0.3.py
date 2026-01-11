@@ -21,11 +21,10 @@ matplotlib.use('QtAgg')
 import numpy as np
 from PIL import Image, ImageDraw
 import mss
-import mss.tools
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QToolBar, QPushButton, QSpinBox, QLabel, QTabWidget, QSplitter,
+    QToolBar, QPushButton, QSpinBox, QDoubleSpinBox, QLabel, QTabWidget, QSplitter,
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsPolygonItem,
     QGraphicsLineItem, QGraphicsEllipseItem, QGraphicsTextItem,
     QScrollArea, QCheckBox, QMessageBox, QGroupBox
@@ -37,6 +36,7 @@ from PySide6.QtGui import (
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from matplotlib.ticker import MaxNLocator, FuncFormatter
 
 
 # =============================================================================
@@ -77,7 +77,6 @@ class ImageData:
     pil_image: Image.Image
     background_polygon: list = field(default_factory=list)
     background_rgb: tuple = (255, 255, 255)
-    measurements: list = field(default_factory=list)
 
 
 # =============================================================================
@@ -223,7 +222,13 @@ def get_line_rgb_values(image: Image.Image, x1: int, y1: int, x2: int, y2: int) 
     red, green, blue = [], [], []
     for x, y in coords:
         if 0 <= x < width and 0 <= y < height:
-            r, g, b = image.getpixel((x, y))[:3]
+            pixel = image.getpixel((x, y))
+            if pixel is None:
+                continue
+            if isinstance(pixel, (tuple, list)):
+                r, g, b = pixel[0], pixel[1], pixel[2]
+            else:
+                r = g = b = int(pixel)  # Grayscale
             red.append(r)
             green.append(g)
             blue.append(b)
@@ -293,7 +298,24 @@ def calculate_contrast(image: Image.Image, segments: list, background_rgb: tuple
         all_green.extend(green_contrast)
         all_blue.extend(blue_contrast)
     
-    return np.array(all_red), np.array(all_green), np.array(all_blue)
+    red_arr = np.array(all_red)
+    green_arr = np.array(all_green)
+    blue_arr = np.array(all_blue)
+
+    def subtract_top3_median(arr: np.ndarray) -> np.ndarray:
+        if arr.size == 0:
+            return arr
+        k = min(3, arr.size)
+        # Get top-k largest values efficiently
+        topk = np.partition(arr, arr.size - k)[-k:]
+        offset = float(np.median(topk))
+        return arr - offset
+
+    red_arr = subtract_top3_median(red_arr)
+    green_arr = subtract_top3_median(green_arr)
+    blue_arr = subtract_top3_median(blue_arr)
+
+    return red_arr, green_arr, blue_arr
 
 
 # =============================================================================
@@ -303,14 +325,20 @@ def calculate_contrast(image: Image.Image, segments: list, background_rgb: tuple
 class ScreenCaptureOverlay(QWidget):
     """
     Full-screen overlay for snip-tool style screenshot selection.
+    Supports both click+drag and click-then-click methods.
     """
     capture_complete = Signal(QPixmap, Image.Image)
     
     def __init__(self):
         super().__init__()
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.setWindowState(Qt.WindowFullScreen)
-        self.setCursor(Qt.CrossCursor)
+        # Use borderless window instead of true fullscreen to avoid macOS conflicts
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint | 
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool  # Prevents app switching issues
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setCursor(Qt.CursorShape.CrossCursor)
         
         self.start_pos = None
         self.end_pos = None
@@ -318,21 +346,34 @@ class ScreenCaptureOverlay(QWidget):
         self.pil_screenshot = None
         self._img_data = None  # Keep reference to prevent garbage collection
         
+        # Track interaction mode
+        self.is_dragging = False  # True if user is click+dragging
+        self.first_click_set = False  # True if first corner is set (click-then-click mode)
+        
         self._capture_screen()
+        
+        # Size to cover screen after capture (so we have screenshot dimensions)
+        if self.screenshot:
+            self.setGeometry(0, 0, self.screenshot.width(), self.screenshot.height())
+        
+        # Enable mouse tracking for hover preview in click-then-click mode
+        self.setMouseTracking(True)
     
     def _capture_screen(self):
         """Capture the entire screen using mss."""
         try:
-            with mss.mss() as sct:
-                # Capture all monitors
-                monitor = sct.monitors[0]  # All monitors combined
+            # Create a new mss instance for each capture to avoid conflicts
+            sct = mss.mss()
+            try:
+                # Capture primary monitor (excludes menu bar on macOS)
+                monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
                 sct_img = sct.grab(monitor)
                 
-                # Convert to PIL Image
+                # Convert to PIL Image - copy the data immediately
                 self.pil_screenshot = Image.frombytes(
                     "RGB",
                     (sct_img.width, sct_img.height),
-                    sct_img.rgb
+                    bytes(sct_img.rgb)  # Convert to bytes to copy the data
                 )
                 
                 # Convert to QPixmap for display - keep reference to img_data
@@ -342,12 +383,16 @@ class ScreenCaptureOverlay(QWidget):
                     self.pil_screenshot.width,
                     self.pil_screenshot.height,
                     self.pil_screenshot.width * 3,
-                    QImage.Format_RGB888
+                    QImage.Format.Format_RGB888
                 )
                 self.screenshot = QPixmap.fromImage(qimage.copy())  # Copy to own the data
+            finally:
+                # Explicitly close mss to release resources
+                sct.close()
         except Exception as e:
             print(f"Screen capture error: {e}")
-            self.close()
+            self.screenshot = None
+            self.pil_screenshot = None
     
     def paintEvent(self, event):
         """Draw the screenshot with selection rectangle overlay."""
@@ -363,9 +408,9 @@ class ScreenCaptureOverlay(QWidget):
         if self.start_pos and self.end_pos:
             rect = QRectF(self.start_pos, self.end_pos).normalized()
             # Clear the selection area
-            painter.setCompositionMode(QPainter.CompositionMode_Clear)
-            painter.fillRect(rect, Qt.transparent)
-            painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+            painter.fillRect(rect, Qt.GlobalColor.transparent)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
             
             # Draw the screenshot in selection area
             if self.screenshot:
@@ -377,21 +422,52 @@ class ScreenCaptureOverlay(QWidget):
             painter.drawRect(rect)
     
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.start_pos = event.position()
-            self.end_pos = event.position()
+        if event.button() == Qt.MouseButton.LeftButton:
+            if not self.first_click_set:
+                # First click - start position
+                self.start_pos = event.position()
+                self.end_pos = event.position()
+                self.is_dragging = False  # Will be set True in mouseMoveEvent if dragging
+            else:
+                # Second click - finalize selection (click-then-click mode)
+                self.end_pos = event.position()
+                self._finalize_capture()
             self.update()
     
     def mouseMoveEvent(self, event):
         if self.start_pos:
-            self.end_pos = event.position()
+            if event.buttons() & Qt.MouseButton.LeftButton:
+                # User is dragging with button held
+                self.is_dragging = True
+                self.end_pos = event.position()
+            elif self.first_click_set:
+                # Click-then-click mode: show preview rectangle following mouse
+                self.end_pos = event.position()
             self.update()
     
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton and self.start_pos and self.end_pos:
-            rect = QRectF(self.start_pos, self.end_pos).normalized().toRect()
+        if event.button() == Qt.MouseButton.LeftButton and self.start_pos:
+            if self.is_dragging:
+                # Drag mode - finalize on release
+                self.end_pos = event.position()
+                self._finalize_capture()
+            else:
+                # Click mode - first click sets corner, wait for second click
+                self.first_click_set = True
+                self.end_pos = event.position()
+            self.update()
+    
+    def _finalize_capture(self):
+        """Process the selection and emit the captured region."""
+        if not self.start_pos or not self.end_pos:
+            self.close()
+            return
             
-            if rect.width() > 10 and rect.height() > 10:
+        rect = QRectF(self.start_pos, self.end_pos).normalized().toRect()
+        
+        # Only process if we have a valid screenshot and reasonable selection size
+        if self.pil_screenshot is not None and rect.width() > 10 and rect.height() > 10:
+            try:
                 # Crop the captured region
                 cropped_pil = self.pil_screenshot.crop((
                     rect.x(), rect.y(),
@@ -399,23 +475,26 @@ class ScreenCaptureOverlay(QWidget):
                     rect.y() + rect.height()
                 ))
                 
-                # Convert to QPixmap - use copy() to ensure data ownership
-                img_data = cropped_pil.tobytes("raw", "RGB")
+                # Convert to QPixmap - keep reference to prevent GC during QImage creation
+                self._cropped_img_data = cropped_pil.tobytes("raw", "RGB")
                 qimage = QImage(
-                    img_data,
+                    self._cropped_img_data,
                     cropped_pil.width,
                     cropped_pil.height,
                     cropped_pil.width * 3,
-                    QImage.Format_RGB888
+                    QImage.Format.Format_RGB888
                 )
+                # Copy to own the pixel data before emitting
                 cropped_pixmap = QPixmap.fromImage(qimage.copy())
                 
                 self.capture_complete.emit(cropped_pixmap, cropped_pil)
-            
-            self.close()
+            except Exception as e:
+                print(f"Error processing capture: {e}")
+        
+        self.close()
     
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
+        if event.key() == Qt.Key.Key_Escape:
             self.close()
 
 
@@ -436,8 +515,8 @@ class ImageCanvas(QGraphicsView):
         super().__init__()
         self._scene = QGraphicsScene()
         self.setScene(self._scene)
-        self.setRenderHint(QPainter.Antialiasing)
-        self.setDragMode(QGraphicsView.NoDrag)
+        self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
         
         self.pixmap_item: Optional[QGraphicsPixmapItem] = None
         self.drawing_mode = None  # 'background' or 'linecut'
@@ -459,6 +538,14 @@ class ImageCanvas(QGraphicsView):
         self.persistent_linecut_items = []  # List of graphics items for completed linecuts
         self.measurement_count = 0  # For assigning colors
         
+        # Background rectangle preview
+        self.bg_preview_rect: Optional[QGraphicsPolygonItem] = None
+        self.bg_preview_line: Optional[QGraphicsLineItem] = None  # Preview line for polygon mode
+        
+        # Background drawing state
+        self.bg_drag_start: Optional[QPointF] = None  # Track drag start position
+        self.bg_is_dragging = False  # True if user is click+dragging
+        
         # RGB text display
         self.rgb_text_item: Optional[QGraphicsTextItem] = None
         
@@ -473,7 +560,7 @@ class ImageCanvas(QGraphicsView):
         self.pixmap_item = QGraphicsPixmapItem(pixmap)
         self._scene.addItem(self.pixmap_item)
         self.setSceneRect(self.pixmap_item.boundingRect())
-        self.fitInView(self.pixmap_item, Qt.KeepAspectRatio)
+        self.fitInView(self.pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
         
         # Reset state
         self.polygon_points = []
@@ -486,23 +573,29 @@ class ImageCanvas(QGraphicsView):
         self.current_preview_line = None
         self.persistent_linecut_items = []
         self.measurement_count = 0
+        self.bg_preview_rect = None
+        self.bg_preview_line = None
+        self.bg_drag_start = None
+        self.bg_is_dragging = False
         self.rgb_text_item = None
     
     def start_background_mode(self):
         """Enter background polygon drawing mode."""
         self.drawing_mode = 'background'
         self.polygon_points = []
+        self.bg_drag_start = None
+        self.bg_is_dragging = False
         self._clear_polygon_preview()
-        self.setCursor(Qt.CrossCursor)
+        self.setCursor(Qt.CursorShape.CrossCursor)
         self.drawing_mode_changed.emit(True)
     
     def start_linecut_mode(self) -> bool:
         """Enter linecut drawing mode. Returns False if background not defined."""
         if not self.has_background:
             self.invalid_action.emit("Define background region first")
-            self.setCursor(Qt.ForbiddenCursor)
+            self.setCursor(Qt.CursorShape.ForbiddenCursor)
             from PySide6.QtCore import QTimer
-            QTimer.singleShot(1000, lambda: self.setCursor(Qt.ArrowCursor))
+            QTimer.singleShot(1000, lambda: self.setCursor(Qt.CursorShape.ArrowCursor))
             return False
         
         self.drawing_mode = 'linecut'
@@ -510,7 +603,7 @@ class ImageCanvas(QGraphicsView):
         self._clear_linecut_preview()
         # Assign color for this linecut
         self.current_linecut_color = MEASUREMENT_COLORS[self.measurement_count % len(MEASUREMENT_COLORS)]
-        self.setCursor(Qt.CrossCursor)
+        self.setCursor(Qt.CursorShape.CrossCursor)
         self.drawing_mode_changed.emit(True)
         return True
     
@@ -522,7 +615,7 @@ class ImageCanvas(QGraphicsView):
         """Exit drawing mode."""
         was_drawing = self.drawing_mode is not None
         self.drawing_mode = None
-        self.setCursor(Qt.ArrowCursor)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
         if was_drawing:
             self.drawing_mode_changed.emit(False)
     
@@ -535,6 +628,50 @@ class ImageCanvas(QGraphicsView):
         for item in self.polygon_preview_items:
             self._scene.removeItem(item)
         self.polygon_preview_items = []
+        
+        if self.bg_preview_rect:
+            self._scene.removeItem(self.bg_preview_rect)
+            self.bg_preview_rect = None
+        
+        if self.bg_preview_line:
+            self._scene.removeItem(self.bg_preview_line)
+            self.bg_preview_line = None
+    
+    def _draw_background_preview(self, mouse_pos: QPointF):
+        """Draw preview for background selection (rectangle or polygon edge)."""
+        # Clear previous rectangle preview
+        if self.bg_preview_rect:
+            self._scene.removeItem(self.bg_preview_rect)
+            self.bg_preview_rect = None
+        
+        # Clear previous line preview
+        if self.bg_preview_line:
+            self._scene.removeItem(self.bg_preview_line)
+            self.bg_preview_line = None
+        
+        if self.bg_is_dragging and self.bg_drag_start:
+            # Rectangle drag mode - show rectangle from drag start to current position
+            p1 = self.bg_drag_start
+            rect_points = [
+                QPointF(p1.x(), p1.y()),
+                QPointF(mouse_pos.x(), p1.y()),
+                QPointF(mouse_pos.x(), mouse_pos.y()),
+                QPointF(p1.x(), mouse_pos.y())
+            ]
+            polygon = QPolygonF(rect_points)
+            self.bg_preview_rect = QGraphicsPolygonItem(polygon)
+            self.bg_preview_rect.setPen(QPen(QColor(0, 255, 0), 2, Qt.PenStyle.DashLine))
+            self.bg_preview_rect.setBrush(QBrush(QColor(0, 255, 0, 40)))
+            self._scene.addItem(self.bg_preview_rect)
+        elif len(self.polygon_points) > 0:
+            # Polygon click mode - show line from last point to mouse
+            last_point = self.polygon_points[-1]
+            self.bg_preview_line = QGraphicsLineItem(
+                last_point.x(), last_point.y(),
+                mouse_pos.x(), mouse_pos.y()
+            )
+            self.bg_preview_line.setPen(QPen(QColor(0, 255, 0, 150), 2, Qt.PenStyle.DashLine))
+            self._scene.addItem(self.bg_preview_line)
     
     def _clear_linecut_preview(self):
         """Clear linecut preview graphics."""
@@ -554,7 +691,7 @@ class ImageCanvas(QGraphicsView):
         """Draw polygon vertices and edges preview."""
         self._clear_polygon_preview()
         
-        pen = QPen(QColor(0, 255, 0), 2)
+        pen = QPen(QColor(0, 255, 0), 2, Qt.PenStyle.DashLine)
         brush = QBrush(QColor(0, 255, 0))
         
         # Draw vertices
@@ -574,29 +711,57 @@ class ImageCanvas(QGraphicsView):
             self._scene.addItem(line)
             self.polygon_preview_items.append(line)
     
-    def _finalize_polygon(self):
-        """Complete the polygon and display it."""
-        if len(self.polygon_points) >= 3:
+    def _finalize_polygon(self, is_rectangle: bool = False):
+        """Complete the polygon and display it.
+        
+        Args:
+            is_rectangle: If True, treat 2 points as rectangle corners.
+                         If False, require at least 3 points for polygon.
+        """
+        min_points = 2 if is_rectangle else 3
+        if len(self.polygon_points) < min_points:
+            # Not enough points, just cancel
+            self.polygon_points = []
+            self.bg_drag_start = None
+            self.bg_is_dragging = False
             self._clear_polygon_preview()
-            
-            # Remove old polygon
-            if self.polygon_item:
-                self._scene.removeItem(self.polygon_item)
-            
-            # Create completed polygon
-            polygon = QPolygonF(self.polygon_points)
-            self.polygon_item = QGraphicsPolygonItem(polygon)
-            self.polygon_item.setPen(QPen(QColor(255, 0, 0), 2))
-            self.polygon_item.setBrush(QBrush(QColor(255, 0, 0, 30)))
-            self._scene.addItem(self.polygon_item)
-            
-            self.has_background = True
-            
-            # Emit signal with points as tuples
-            points_as_tuples = [(int(p.x()), int(p.y())) for p in self.polygon_points]
-            self.polygon_complete.emit(points_as_tuples)
+            self.stop_drawing()
+            return
+        
+        self._clear_polygon_preview()
+        
+        # Remove old polygon
+        if self.polygon_item:
+            self._scene.removeItem(self.polygon_item)
+        
+        # If exactly 2 points and is_rectangle, create rectangle from opposite corners
+        if len(self.polygon_points) == 2 and is_rectangle:
+            p1 = self.polygon_points[0]
+            p2 = self.polygon_points[1]
+            # Create rectangle corners (clockwise from p1)
+            self.polygon_points = [
+                QPointF(p1.x(), p1.y()),
+                QPointF(p2.x(), p1.y()),
+                QPointF(p2.x(), p2.y()),
+                QPointF(p1.x(), p2.y())
+            ]
+        
+        # Create completed polygon
+        polygon = QPolygonF(self.polygon_points)
+        self.polygon_item = QGraphicsPolygonItem(polygon)
+        self.polygon_item.setPen(QPen(QColor(255, 0, 0), 2, Qt.PenStyle.DashLine))
+        self.polygon_item.setBrush(QBrush(QColor(255, 0, 0, 30)))
+        self._scene.addItem(self.polygon_item)
+        
+        self.has_background = True
+        
+        # Emit signal with points as tuples
+        points_as_tuples = [(int(p.x()), int(p.y())) for p in self.polygon_points]
+        self.polygon_complete.emit(points_as_tuples)
         
         self.polygon_points = []
+        self.bg_drag_start = None
+        self.bg_is_dragging = False
         self.stop_drawing()
     
     def _draw_linecut_preview(self, mouse_pos: Optional[QPointF] = None):
@@ -613,7 +778,7 @@ class ImageCanvas(QGraphicsView):
         # Use the assigned color for this linecut
         linecut_color = QColor(self.current_linecut_color)
         pen = QPen(linecut_color, 2)
-        width_pen = QPen(linecut_color.lighter(150), 1, Qt.DashLine)
+        width_pen = QPen(linecut_color.lighter(150), 1, Qt.PenStyle.DashLine)
         point_brush = QBrush(linecut_color)
         
         # Draw existing points
@@ -621,14 +786,16 @@ class ImageCanvas(QGraphicsView):
             self._scene.removeItem(item)
         self.linecut_preview_items = []
         
-        for point in self.linecut_points:
-            ellipse = QGraphicsEllipseItem(point.x() - 4, point.y() - 4, 8, 8)
+        # Only draw a small dot at the starting point
+        if len(self.linecut_points) > 0:
+            start_point = self.linecut_points[0]
+            ellipse = QGraphicsEllipseItem(start_point.x() - 2.5, start_point.y() - 2.5, 5, 5)
             ellipse.setPen(pen)
             ellipse.setBrush(point_brush)
             self._scene.addItem(ellipse)
             self.linecut_preview_items.append(ellipse)
         
-        # Draw confirmed segments
+        # Draw confirmed segments with direction arrows
         for i in range(len(self.linecut_points) - 1):
             p1 = self.linecut_points[i]
             p2 = self.linecut_points[i + 1]
@@ -636,6 +803,12 @@ class ImageCanvas(QGraphicsView):
             line.setPen(pen)
             self._scene.addItem(line)
             self.linecut_preview_items.append(line)
+            
+            # Add arrowhead to show direction
+            arrow = self._create_arrowhead(p1.x(), p1.y(), p2.x(), p2.y(), linecut_color)
+            if arrow:
+                self._scene.addItem(arrow)
+                self.linecut_preview_items.append(arrow)
             
             # Draw width preview for confirmed segments
             self._draw_width_preview(p1, p2, width_pen)
@@ -647,12 +820,47 @@ class ImageCanvas(QGraphicsView):
                 last_point.x(), last_point.y(),
                 mouse_pos.x(), mouse_pos.y()
             )
-            preview_pen = QPen(QColor(255, 255, 255, 150), 2, Qt.DashLine)
+            preview_pen = QPen(QColor(255, 255, 255, 150), 2, Qt.PenStyle.DashLine)
             self.current_preview_line.setPen(preview_pen)
             self._scene.addItem(self.current_preview_line)
             
             # Preview width for potential segment
             self._draw_width_preview(last_point, mouse_pos, width_pen, preview=True)
+    
+    def _create_arrowhead(self, x1: float, y1: float, x2: float, y2: float, 
+                          color: QColor, size: float = 8) -> Optional[QGraphicsPolygonItem]:
+        """Create an arrowhead pointing from (x1,y1) to (x2,y2)."""
+        # Calculate direction vector
+        dx = x2 - x1
+        dy = y2 - y1
+        length = math.sqrt(dx*dx + dy*dy)
+        
+        if length == 0:
+            return None
+        
+        # Unit vector in direction of line
+        ux = dx / length
+        uy = dy / length
+        
+        # Perpendicular unit vector
+        px = -uy
+        py = ux
+        
+        # Arrow tip at (x2, y2), base points offset back and to the sides
+        tip = QPointF(x2, y2)
+        base_center_x = x2 - ux * size
+        base_center_y = y2 - uy * size
+        
+        left = QPointF(base_center_x + px * size * 0.5, base_center_y + py * size * 0.5)
+        right = QPointF(base_center_x - px * size * 0.5, base_center_y - py * size * 0.5)
+        
+        # Create triangle polygon
+        arrow_polygon = QPolygonF([tip, left, right])
+        arrow_item = QGraphicsPolygonItem(arrow_polygon)
+        arrow_item.setPen(QPen(color, 1))
+        arrow_item.setBrush(QBrush(color))
+        
+        return arrow_item
     
     def _draw_width_preview(self, p1: QPointF, p2: QPointF, pen: QPen, preview: bool = False):
         """Draw parallel lines showing averaging width."""
@@ -704,21 +912,22 @@ class ImageCanvas(QGraphicsView):
     def _add_persistent_linecut(self, points: list, color: str):
         """Add permanent linecut graphics to the scene."""
         qcolor = QColor(color)
-        pen = QPen(qcolor, 2)
+        pen = QPen(qcolor, 2, Qt.PenStyle.DashLine)
         point_brush = QBrush(qcolor)
-        width_pen = QPen(qcolor.lighter(150), 1, Qt.DashLine)
+        width_pen = QPen(qcolor.lighter(150), 1, Qt.PenStyle.DashLine)
         
         items = []
         
-        # Draw points
-        for point in points:
-            ellipse = QGraphicsEllipseItem(point.x() - 4, point.y() - 4, 8, 8)
+        # Draw only the starting point (small dot)
+        if len(points) > 0:
+            start_point = points[0]
+            ellipse = QGraphicsEllipseItem(start_point.x() - 2.5, start_point.y() - 2.5, 5, 5)
             ellipse.setPen(pen)
             ellipse.setBrush(point_brush)
             self._scene.addItem(ellipse)
             items.append(ellipse)
         
-        # Draw line segments
+        # Draw line segments with direction arrows
         for i in range(len(points) - 1):
             p1 = points[i]
             p2 = points[i + 1]
@@ -726,6 +935,12 @@ class ImageCanvas(QGraphicsView):
             line.setPen(pen)
             self._scene.addItem(line)
             items.append(line)
+            
+            # Add arrowhead to show direction
+            arrow = self._create_arrowhead(p1.x(), p1.y(), p2.x(), p2.y(), qcolor)
+            if arrow:
+                self._scene.addItem(arrow)
+                items.append(arrow)
             
             # Draw width indicators
             half_width = self.averaging_width // 2
@@ -752,6 +967,60 @@ class ImageCanvas(QGraphicsView):
                 self._scene.removeItem(item)
             del self.persistent_linecut_items[index]
     
+    def update_persistent_linecut_width(self, index: int, new_width: int, segments: list, color: str):
+        """Update the width indicator graphics for a persistent linecut."""
+        if 0 <= index < len(self.persistent_linecut_items):
+            # Remove old graphics
+            for item in self.persistent_linecut_items[index]:
+                self._scene.removeItem(item)
+            
+            # Recreate with new width
+            qcolor = QColor(color)
+            pen = QPen(qcolor, 2)
+            point_brush = QBrush(qcolor)
+            width_pen = QPen(qcolor.lighter(150), 1, Qt.PenStyle.DashLine)
+            
+            items = []
+            half_width = new_width // 2
+            
+            # Draw points and lines for each segment
+            for i, ((x1, y1), (x2, y2)) in enumerate(segments):
+                # Draw only the starting point (small dot) for the first segment
+                if i == 0:
+                    ellipse = QGraphicsEllipseItem(x1 - 2.5, y1 - 2.5, 5, 5)
+                    ellipse.setPen(pen)
+                    ellipse.setBrush(point_brush)
+                    self._scene.addItem(ellipse)
+                    items.append(ellipse)
+                
+                # Draw line segment
+                line = QGraphicsLineItem(x1, y1, x2, y2)
+                line.setPen(pen)
+                self._scene.addItem(line)
+                items.append(line)
+                
+                # Add arrowhead to show direction
+                arrow = self._create_arrowhead(x1, y1, x2, y2, qcolor)
+                if arrow:
+                    self._scene.addItem(arrow)
+                    items.append(arrow)
+                
+                # Draw width indicators
+                if half_width >= 1:
+                    nx1, ny1, nx2, ny2 = offset_parallel_line(x1, y1, x2, y2, half_width)
+                    upper = QGraphicsLineItem(nx1, ny1, nx2, ny2)
+                    upper.setPen(width_pen)
+                    self._scene.addItem(upper)
+                    items.append(upper)
+                    
+                    nx1, ny1, nx2, ny2 = offset_parallel_line(x1, y1, x2, y2, -half_width)
+                    lower = QGraphicsLineItem(nx1, ny1, nx2, ny2)
+                    lower.setPen(width_pen)
+                    self._scene.addItem(lower)
+                    items.append(lower)
+            
+            self.persistent_linecut_items[index] = items
+    
     def display_rgb_text(self, rgb: tuple):
         """Display average RGB in corner of image."""
         if self.rgb_text_item:
@@ -762,10 +1031,18 @@ class ImageCanvas(QGraphicsView):
         self.rgb_text_item.setDefaultTextColor(QColor(255, 255, 255))
         self.rgb_text_item.setFont(QFont("Arial", 10))
         
-        # Position in top-left corner
-        self.rgb_text_item.setPos(5, 5)
+        # Position in bottom-right corner of the image
+        if self.pixmap_item:
+            img_rect = self.pixmap_item.boundingRect()
+            text_width = self.rgb_text_item.boundingRect().width()
+            text_height = self.rgb_text_item.boundingRect().height()
+            self.rgb_text_item.setPos(
+                img_rect.right() - text_width - 5,
+                img_rect.bottom() - text_height - 5
+            )
+        else:
+            self.rgb_text_item.setPos(5, 5)
         
-        # Add background rectangle for visibility
         self._scene.addItem(self.rgb_text_item)
     
     def mousePressEvent(self, event):
@@ -776,8 +1053,14 @@ class ImageCanvas(QGraphicsView):
         scene_pos = self.mapToScene(event.position().toPoint())
         
         if self.drawing_mode == 'background':
-            self.polygon_points.append(scene_pos)
-            self._draw_polygon_preview()
+            if len(self.polygon_points) == 0:
+                # First click - could be start of drag or polygon
+                self.bg_drag_start = scene_pos
+                self.bg_is_dragging = False  # Will be set to True in mouseMoveEvent if dragging
+            else:
+                # Subsequent click - adding polygon vertex
+                self.polygon_points.append(scene_pos)
+                self._draw_polygon_preview()
         
         elif self.drawing_mode == 'linecut':
             self.linecut_points.append(scene_pos)
@@ -787,23 +1070,50 @@ class ImageCanvas(QGraphicsView):
         scene_pos = self.mapToScene(event.position().toPoint())
         
         if self.drawing_mode == 'background':
+            # Double-click finalizes polygon; add current point as final vertex
             self.polygon_points.append(scene_pos)
-            self._finalize_polygon()
+            self._finalize_polygon(is_rectangle=False)
         
         elif self.drawing_mode == 'linecut':
             self.linecut_points.append(scene_pos)
             self._finalize_linecut()
     
     def mouseMoveEvent(self, event):
-        if self.drawing_mode == 'linecut' and len(self.linecut_points) > 0:
-            scene_pos = self.mapToScene(event.position().toPoint())
+        scene_pos = self.mapToScene(event.position().toPoint())
+        
+        if self.drawing_mode == 'background':
+            if self.bg_drag_start and event.buttons() & Qt.MouseButton.LeftButton:
+                # User is dragging - switch to drag mode
+                self.bg_is_dragging = True
+                self._draw_background_preview(scene_pos)
+            elif len(self.polygon_points) > 0:
+                # Polygon mode - show preview line
+                self._draw_background_preview(scene_pos)
+        elif self.drawing_mode == 'linecut' and len(self.linecut_points) > 0:
             self._draw_linecut_preview(scene_pos)
+        
         super().mouseMoveEvent(event)
+    
+    def mouseReleaseEvent(self, event):
+        if self.drawing_mode == 'background' and self.bg_drag_start:
+            scene_pos = self.mapToScene(event.position().toPoint())
+            
+            if self.bg_is_dragging:
+                # Dragged - create rectangle
+                self.polygon_points = [self.bg_drag_start, scene_pos]
+                self._finalize_polygon(is_rectangle=True)
+            else:
+                # Just clicked (no drag) - start polygon mode
+                self.polygon_points.append(self.bg_drag_start)
+                self.bg_drag_start = None
+                self._draw_polygon_preview()
+        
+        super().mouseReleaseEvent(event)
     
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self.pixmap_item:
-            self.fitInView(self.pixmap_item, Qt.KeepAspectRatio)
+            self.fitInView(self.pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
 
 
 # =============================================================================
@@ -835,7 +1145,7 @@ class MeasurementListItem(QWidget):
         # Width input
         layout.addWidget(QLabel("Width:"))
         self.width_input = QSpinBox()
-        self.width_input.setRange(1, 100)
+        self.width_input.setRange(1, 999)
         self.width_input.setValue(width)
         self.width_input.valueChanged.connect(self._on_width_changed)
         layout.addWidget(self.width_input)
@@ -856,6 +1166,7 @@ class MeasurementListItem(QWidget):
 class DataDisplayPanel(QWidget):
     """Panel for displaying RGB contrast plots and measurement list."""
     measurement_removed = Signal(int)  # Signal when measurement is removed
+    width_change_requested = Signal(int, int)  # (measurement_index, new_width)
     
     def __init__(self):
         super().__init__()
@@ -866,6 +1177,11 @@ class DataDisplayPanel(QWidget):
         self.show_green = True
         self.show_blue = False
         
+        # Y-axis limit settings (fraction units; plotting scales to %)
+        self.use_fixed_yaxis = False
+        self.yaxis_min = -0.2
+        self.yaxis_max = 0.05
+        
         layout = QVBoxLayout(self)
         
         # Channel selection checkboxes
@@ -874,19 +1190,19 @@ class DataDisplayPanel(QWidget):
         
         self.red_checkbox = QCheckBox("Red")
         self.red_checkbox.setChecked(self.show_red)
-        self.red_checkbox.setStyleSheet("color: red;")
+        self.red_checkbox.setStyleSheet("QCheckBox { color: #cc0000; font-weight: bold; }")
         self.red_checkbox.stateChanged.connect(self._on_channel_changed)
         channel_layout.addWidget(self.red_checkbox)
         
         self.green_checkbox = QCheckBox("Green")
         self.green_checkbox.setChecked(self.show_green)
-        self.green_checkbox.setStyleSheet("color: green;")
+        self.green_checkbox.setStyleSheet("QCheckBox { color: #008800; font-weight: bold; }")
         self.green_checkbox.stateChanged.connect(self._on_channel_changed)
         channel_layout.addWidget(self.green_checkbox)
         
         self.blue_checkbox = QCheckBox("Blue")
         self.blue_checkbox.setChecked(self.show_blue)
-        self.blue_checkbox.setStyleSheet("color: blue;")
+        self.blue_checkbox.setStyleSheet("QCheckBox { color: #0066cc; font-weight: bold; }")
         self.blue_checkbox.stateChanged.connect(self._on_channel_changed)
         channel_layout.addWidget(self.blue_checkbox)
         
@@ -904,7 +1220,7 @@ class DataDisplayPanel(QWidget):
         self.list_scroll.setWidgetResizable(True)
         self.list_widget = QWidget()
         self.list_layout = QVBoxLayout(self.list_widget)
-        self.list_layout.setAlignment(Qt.AlignTop)
+        self.list_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.list_scroll.setWidget(self.list_widget)
         self.list_scroll.setMaximumHeight(150)
         layout.addWidget(self.list_scroll, stretch=1)
@@ -946,13 +1262,23 @@ class DataDisplayPanel(QWidget):
         for i, (color, title) in enumerate(visible_channels):
             ax = self.figure.add_subplot(n_plots, 1, i + 1)
             ax.set_xlabel('Pixels')
-            ax.set_ylabel('Contrast', color=color, fontweight='bold')
+            ax.set_ylabel('Contrast (%)', color=color, fontweight='bold')
             ax.tick_params(axis='y', labelcolor=color)
             ax.grid(True, alpha=0.3)
             ax.axhline(y=0, color='gray', linestyle='-', linewidth=0.5)
+            # Increase number of tick marks
+            ax.yaxis.set_major_locator(MaxNLocator(nbins=10))
+            # Format ticks as percent
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda y, pos: f"{y:.0f}%"))
             axes[color] = ax
         
         self.figure.tight_layout()
+        
+        # Add baseline shift note in bottom left
+        self.figure.text(0.02, 0.01, '(Shifted baseline)', 
+                        fontsize=8, color='gray', style='italic',
+                        ha='left', va='bottom')
+        
         return axes
     
     def add_measurement(self, measurement: Measurement):
@@ -961,6 +1287,13 @@ class DataDisplayPanel(QWidget):
         self.measurements.append(measurement)
         self._update_plots()
         self._update_list()
+    
+    def set_yaxis_limits(self, use_fixed: bool, y_min: float, y_max: float):
+        """Set Y-axis limit parameters and refresh plots."""
+        self.use_fixed_yaxis = use_fixed
+        self.yaxis_min = y_min
+        self.yaxis_max = y_max
+        self._update_plots()
     
     def remove_measurement(self, index: int):
         """Remove a measurement by index."""
@@ -974,9 +1307,9 @@ class DataDisplayPanel(QWidget):
             self.measurement_removed.emit(index)
     
     def update_measurement_width(self, index: int, new_width: int):
-        """Update a measurement's width (note: doesn't recalculate contrast)."""
+        """Request recalculation with new width (actual update happens in ImageTab)."""
         if 0 <= index < len(self.measurements):
-            self.measurements[index].width = new_width
+            self.width_change_requested.emit(index, new_width)
     
     def _update_plots(self):
         """Redraw all plots with current measurements."""
@@ -994,13 +1327,13 @@ class DataDisplayPanel(QWidget):
                 x = np.arange(len(m.red_contrast))
                 
                 if self.show_red and 'red' in axes:
-                    axes['red'].plot(x, m.red_contrast, color=color, alpha=alpha, 
+                    axes['red'].plot(x, m.red_contrast * 100.0, color=color, alpha=alpha, 
                                    label=m.name, linewidth=1.5)
                 if self.show_green and 'green' in axes:
-                    axes['green'].plot(x, m.green_contrast, color=color, alpha=alpha,
+                    axes['green'].plot(x, m.green_contrast * 100.0, color=color, alpha=alpha,
                                      label=m.name, linewidth=1.5)
                 if self.show_blue and 'blue' in axes:
-                    axes['blue'].plot(x, m.blue_contrast, color=color, alpha=alpha,
+                    axes['blue'].plot(x, m.blue_contrast * 100.0, color=color, alpha=alpha,
                                     label=m.name, linewidth=1.5)
         
         # Add legends to first visible axis
@@ -1008,8 +1341,21 @@ class DataDisplayPanel(QWidget):
             first_ax = list(axes.values())[0]
             first_ax.legend(fontsize=8, loc='upper right')
         
+        # Apply fixed Y-axis limits if enabled
+        if self.use_fixed_yaxis:
+            for ax in axes.values():
+                ax.set_ylim(self.yaxis_min * 100.0, self.yaxis_max * 100.0)
+        
         self.figure.tight_layout()
         self.canvas.draw()
+    
+    def update_measurement_data(self, index: int, red: np.ndarray, green: np.ndarray, blue: np.ndarray):
+        """Update a measurement's contrast data and refresh plots."""
+        if 0 <= index < len(self.measurements):
+            self.measurements[index].red_contrast = red
+            self.measurements[index].green_contrast = green
+            self.measurements[index].blue_contrast = blue
+            self._update_plots()
     
     def _update_list(self):
         """Update the measurement list widget."""
@@ -1041,7 +1387,7 @@ class ImageTab(QWidget):
         layout = QHBoxLayout(self)
         
         # Splitter for resizable panels
-        splitter = QSplitter(Qt.Horizontal)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
         
         # Image canvas
         self.canvas = ImageCanvas()
@@ -1056,6 +1402,7 @@ class ImageTab(QWidget):
         # Data display
         self.data_panel = DataDisplayPanel()
         self.data_panel.measurement_removed.connect(self._on_measurement_removed)
+        self.data_panel.width_change_requested.connect(self._on_width_change_requested)
         splitter.addWidget(self.data_panel)
         
         splitter.setSizes([500, 400])
@@ -1078,8 +1425,44 @@ class ImageTab(QWidget):
     def _on_measurement_removed(self, index: int):
         """Handle measurement removal - also remove from canvas."""
         self.canvas.remove_persistent_linecut(index)
-        if 0 <= index < len(self.data.measurements):
-            del self.data.measurements[index]
+
+    def _on_width_change_requested(self, index: int, new_width: int):
+        """Recalculate measurement data when width changes."""
+        measurements = self.data_panel.measurements
+        if 0 <= index < len(measurements):
+            measurement = measurements[index]
+            # Recalculate contrast with new width
+            red, green, blue = calculate_contrast(
+                self.data.pil_image,
+                measurement.segments,
+                self.data.background_rgb,
+                new_width
+            )
+            # Update the measurement data
+            measurement.red_contrast = red
+            measurement.green_contrast = green
+            measurement.blue_contrast = blue
+            measurement.width = new_width
+            # Update the display
+            self.data_panel.update_measurement_data(index, red, green, blue)
+            # Update the linecut graphics on the canvas
+            self.canvas.update_persistent_linecut_width(
+                index, new_width, measurement.segments, measurement.color
+            )
+    
+    def _recalculate_all_measurements(self):
+        """Recalculate all measurements with current background."""
+        for i, measurement in enumerate(self.data_panel.measurements):
+            red, green, blue = calculate_contrast(
+                self.data.pil_image,
+                measurement.segments,
+                self.data.background_rgb,
+                measurement.width
+            )
+            measurement.red_contrast = red
+            measurement.green_contrast = green
+            measurement.blue_contrast = blue
+            self.data_panel.update_measurement_data(i, red, green, blue)
     
     def _on_polygon_complete(self, points: list):
         """Handle completed background polygon."""
@@ -1091,6 +1474,10 @@ class ImageTab(QWidget):
         
         # Display RGB on canvas
         self.canvas.display_rgb_text(self.data.background_rgb)
+        
+        # Recalculate all existing measurements with new background
+        if self.data_panel.measurements:
+            self._recalculate_all_measurements()
     
     def _on_linecut_complete(self, segments: list):
         """Handle completed linecut."""
@@ -1119,7 +1506,6 @@ class ImageTab(QWidget):
             color=linecut_color
         )
         
-        self.data.measurements.append(measurement)
         self.data_panel.add_measurement(measurement)
 
 
@@ -1147,6 +1533,7 @@ class MainWindow(QMainWindow):
         # Toolbar
         self.toolbar = QToolBar()
         self.toolbar.setMovable(False)
+        self.toolbar.setStyleSheet("QToolBar { spacing: 8px; padding: 4px; }")
         self.addToolBar(self.toolbar)
         
         # Capture button
@@ -1172,23 +1559,59 @@ class MainWindow(QMainWindow):
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.clicked.connect(self._cancel_selection)
         self.cancel_btn.setVisible(False)
-        self.cancel_btn.setStyleSheet("background-color: #ff6b6b; color: white; font-weight: bold;")
         self.toolbar.addWidget(self.cancel_btn)
         
         self.toolbar.addSeparator()
         
         # Width input
-        self.width_label = QLabel("Width:")
+        self.width_label = QLabel(" Width:")
         self.toolbar.addWidget(self.width_label)
         self.width_input = QSpinBox()
-        self.width_input.setRange(1, 100)
+        self.width_input.setRange(1, 999)
         self.width_input.setValue(10)
         self.width_input.setToolTip("Averaging width for linecut")
         self.toolbar.addWidget(self.width_input)
         
+        self.toolbar.addSeparator()
+        
+        # Y-axis controls
+        self.yaxis_checkbox = QCheckBox(" Fixed Y-Axis")
+        self.yaxis_checkbox.setChecked(False)
+        self.yaxis_checkbox.setToolTip("Use fixed Y-axis limits across all plots")
+        self.yaxis_checkbox.stateChanged.connect(self._on_yaxis_settings_changed)
+        self.toolbar.addWidget(self.yaxis_checkbox)
+        
+        self.yaxis_min_label = QLabel(" Min:")
+        self.toolbar.addWidget(self.yaxis_min_label)
+        self.yaxis_min_input = QDoubleSpinBox()
+        self.yaxis_min_input.setRange(-10.0, 10.0)
+        self.yaxis_min_input.setValue(-0.2)
+        self.yaxis_min_input.setSingleStep(0.1)
+        self.yaxis_min_input.setDecimals(2)
+        self.yaxis_min_input.setToolTip("Minimum Y-axis value")
+        self.yaxis_min_input.valueChanged.connect(self._on_yaxis_settings_changed)
+        self.toolbar.addWidget(self.yaxis_min_input)
+        
+        self.yaxis_max_label = QLabel(" Max:")
+        self.toolbar.addWidget(self.yaxis_max_label)
+        self.yaxis_max_input = QDoubleSpinBox()
+        self.yaxis_max_input.setRange(-10.0, 10.0)
+        self.yaxis_max_input.setValue(0.05)
+        self.yaxis_max_input.setSingleStep(0.1)
+        self.yaxis_max_input.setDecimals(2)
+        self.yaxis_max_input.setToolTip("Maximum Y-axis value")
+        self.yaxis_max_input.valueChanged.connect(self._on_yaxis_settings_changed)
+        self.toolbar.addWidget(self.yaxis_max_input)
+        
+        # Spacer to push mode indicator to the right
+        spacer = QWidget()
+        spacer.setSizePolicy(spacer.sizePolicy().horizontalPolicy(), spacer.sizePolicy().verticalPolicy())
+        spacer.setMinimumWidth(20)
+        self.toolbar.addWidget(spacer)
+        
         # Selection mode indicator
         self.mode_indicator = QLabel("")
-        self.mode_indicator.setStyleSheet("color: #ffa500; font-weight: bold; padding-left: 20px;")
+        self.mode_indicator.setStyleSheet("font-weight: bold;")
         self.toolbar.addWidget(self.mode_indicator)
         
         # Tab widget
@@ -1212,10 +1635,21 @@ class MainWindow(QMainWindow):
     
     def _show_capture_overlay(self):
         """Show the capture overlay after delay."""
-        self.capture_overlay = ScreenCaptureOverlay()
-        self.capture_overlay.capture_complete.connect(self._on_capture_complete)
-        self.capture_overlay.destroyed.connect(self._on_capture_cancelled)
-        self.capture_overlay.show()
+        try:
+            self.capture_overlay = ScreenCaptureOverlay()
+            # Check if capture was successful
+            if self.capture_overlay.screenshot is None:
+                print("Screen capture failed - could not grab screen")
+                self.capture_overlay.close()
+                self.capture_overlay = None
+                self.show()
+                return
+            self.capture_overlay.capture_complete.connect(self._on_capture_complete)
+            self.capture_overlay.destroyed.connect(self._on_capture_cancelled)
+            self.capture_overlay.show()
+        except Exception as e:
+            print(f"Error creating capture overlay: {e}")
+            self.show()
     
     def _on_capture_complete(self, pixmap: QPixmap, pil_image: Image.Image):
         """Handle completed screen capture."""
@@ -1224,6 +1658,14 @@ class MainWindow(QMainWindow):
         # Create new tab
         tab = ImageTab(pixmap, pil_image)
         tab.drawing_mode_changed.connect(self._on_drawing_mode_changed)
+        
+        # Apply current Y-axis settings to new tab
+        tab.data_panel.set_yaxis_limits(
+            self.yaxis_checkbox.isChecked(),
+            self.yaxis_min_input.value(),
+            self.yaxis_max_input.value()
+        )
+        
         index = self.tabs.addTab(tab, f"Image {self.tabs.count() + 1}")
         self.tabs.setCurrentIndex(index)
         
@@ -1272,6 +1714,18 @@ class MainWindow(QMainWindow):
         if tab:
             tab.start_linecut(self.width_input.value())
     
+    def _on_yaxis_settings_changed(self):
+        """Update Y-axis settings for all tabs."""
+        use_fixed = self.yaxis_checkbox.isChecked()
+        y_min = self.yaxis_min_input.value()
+        y_max = self.yaxis_max_input.value()
+        
+        # Apply to all tabs
+        for i in range(self.tabs.count()):
+            tab = self.tabs.widget(i)
+            if isinstance(tab, ImageTab):
+                tab.data_panel.set_yaxis_limits(use_fixed, y_min, y_max)
+    
     def _on_drawing_mode_changed(self, is_drawing: bool):
         """Handle drawing mode state changes - gray out UI when in selection mode."""
         self._in_selection_mode = is_drawing
@@ -1283,39 +1737,42 @@ class MainWindow(QMainWindow):
             self.linecut_btn.setEnabled(False)
             self.width_input.setEnabled(False)
             self.width_label.setEnabled(False)
+            self.yaxis_checkbox.setEnabled(False)
+            self.yaxis_min_input.setEnabled(False)
+            self.yaxis_max_input.setEnabled(False)
+            self.yaxis_min_label.setEnabled(False)
+            self.yaxis_max_label.setEnabled(False)
             self.tabs.tabBar().setEnabled(False)
             self.cancel_btn.setVisible(True)
             
-            # Gray out the toolbar appearance
-            self.toolbar.setStyleSheet("""
-                QToolBar {
-                    background-color: #3a3a3a;
-                }
-                QPushButton:disabled {
-                    background-color: #555555;
-                    color: #888888;
-                }
-                QSpinBox:disabled {
-                    background-color: #555555;
-                    color: #888888;
-                }
-                QLabel:disabled {
-                    color: #888888;
-                }
-            """)
+            # Style cancel button prominently (works in light/dark)
+            self.cancel_btn.setStyleSheet(
+                "QPushButton { background-color: #dc3545; color: white; font-weight: bold; "
+                "border: none; padding: 4px 12px; border-radius: 3px; }"
+                "QPushButton:hover { background-color: #c82333; }"
+            )
+            
+            # Update mode indicator with theme-aware orange
+            self.mode_indicator.setStyleSheet("color: #ff8c00; font-weight: bold;")
             
             # Update mode indicator
             tab = self._current_tab()
             if tab and tab.canvas.drawing_mode == 'background':
-                self.mode_indicator.setText("🎯 Click to draw background polygon, double-click to finish")
+                self.mode_indicator.setText("🎯 Drag for rectangle, or click vertices then double-click to finish polygon")
             elif tab and tab.canvas.drawing_mode == 'linecut':
                 self.mode_indicator.setText("🎯 Click to draw linecut, double-click to finish")
         else:
             # Re-enable toolbar controls
             self.tabs.tabBar().setEnabled(True)
             self.cancel_btn.setVisible(False)
-            self.toolbar.setStyleSheet("")  # Reset stylesheet
+            self.cancel_btn.setStyleSheet("")  # Reset cancel button style
             self.mode_indicator.setText("")
+            self.mode_indicator.setStyleSheet("font-weight: bold;")  # Reset mode indicator
+            self.yaxis_checkbox.setEnabled(True)
+            self.yaxis_min_input.setEnabled(True)
+            self.yaxis_max_input.setEnabled(True)
+            self.yaxis_min_label.setEnabled(True)
+            self.yaxis_max_label.setEnabled(True)
             self._update_button_states()
     
     def _cancel_selection(self):
@@ -1327,6 +1784,8 @@ class MainWindow(QMainWindow):
             tab.canvas._clear_linecut_preview()
             tab.canvas.polygon_points = []
             tab.canvas.linecut_points = []
+            tab.canvas.bg_drag_start = None
+            tab.canvas.bg_is_dragging = False
 
 
 # =============================================================================
@@ -1336,7 +1795,7 @@ class MainWindow(QMainWindow):
 def main():
     # Ensure only one QApplication instance
     app = QApplication.instance()
-    if app is None:
+    if not isinstance(app, QApplication):
         app = QApplication(sys.argv)
     
     app.setStyle('Fusion')
