@@ -1,3 +1,0 @@
-([('OpticalFlake',
-   '/Users/jeff/Coding/python/opticalFlake/dist/OpticalFlake',
-   'EXECUTABLE')],)
