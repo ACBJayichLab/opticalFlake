@@ -1184,7 +1184,7 @@ class DataDisplayPanel(QWidget):
         self.yaxis_max = 0.05
         
         # Baseline points for contrast calculation
-        self.baseline_points = 5
+        self.baseline_points = 8
         
         # Reference line settings per channel (stored in percent units for display)
         self.reference_values = {
@@ -1199,11 +1199,13 @@ class DataDisplayPanel(QWidget):
         self._axes_map = {}  # Map axes to channel names
         
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)  # No margins for main layout
+        layout.setSpacing(2)  # Minimal spacing between elements
         
         # Channel selection checkboxes (no title, tight layout)
         channel_group = QGroupBox()
         channel_layout = QHBoxLayout(channel_group)
-        channel_layout.setContentsMargins(5, 2, 5, 2)
+        channel_layout.setContentsMargins(5, 0, 5, 1)
         channel_layout.setSpacing(8)
         
         self.red_checkbox = QCheckBox("Red")
@@ -1240,7 +1242,7 @@ class DataDisplayPanel(QWidget):
         # Layer count and reference value controls (no title, tight layout)
         ref_group = QGroupBox()
         ref_layout = QHBoxLayout(ref_group)
-        ref_layout.setContentsMargins(5, 2, 5, 2)
+        ref_layout.setContentsMargins(5, 1, 5, 2)
         ref_layout.setSpacing(8)
         
         # Enable checkbox for reference lines
@@ -1437,7 +1439,8 @@ class DataDisplayPanel(QWidget):
             axes[color] = ax
             self._axes_map[ax] = color  # Map axis to channel name
         
-        self.figure.tight_layout()
+        # Use tight_layout with padding to prevent overlap
+        self.figure.tight_layout(pad=1.0, h_pad=1.5)
         
         # Add baseline shift note in bottom left (slightly up to overlap with plot box)
         self.figure.text(0.02, 0.03, '(Shifted baseline)', 
@@ -1514,7 +1517,7 @@ class DataDisplayPanel(QWidget):
         # Draw reference lines on all visible axes
         self._draw_reference_lines(axes)
         
-        self.figure.tight_layout()
+        self.figure.tight_layout(pad=1.0, h_pad=1.5)
         self.canvas.draw()
     
     def _draw_reference_lines(self, axes: dict):
