@@ -236,7 +236,7 @@ def get_line_rgb_values(image: Image.Image, x1: int, y1: int, x2: int, y2: int) 
     return np.array(red), np.array(green), np.array(blue)
 
 
-def calculate_contrast(image: Image.Image, segments: list, background_rgb: tuple, width: int) -> tuple:
+def calculate_contrast(image: Image.Image, segments: list, background_rgb: tuple, width: int, baseline_points: int = 3) -> tuple:
     """
     Calculate RGB contrast along a multi-segment linecut with averaging width.
     
@@ -245,6 +245,7 @@ def calculate_contrast(image: Image.Image, segments: list, background_rgb: tuple
         segments: List of ((x1, y1), (x2, y2)) segment tuples
         background_rgb: Background (r, g, b) tuple
         width: Averaging width
+        baseline_points: Number of highest points to use for baseline subtraction
         
     Returns:
         (red_contrast, green_contrast, blue_contrast) numpy arrays
@@ -302,18 +303,18 @@ def calculate_contrast(image: Image.Image, segments: list, background_rgb: tuple
     green_arr = np.array(all_green)
     blue_arr = np.array(all_blue)
 
-    def subtract_top3_median(arr: np.ndarray) -> np.ndarray:
+    def subtract_topk_median(arr: np.ndarray, k: int) -> np.ndarray:
         if arr.size == 0:
             return arr
-        k = min(3, arr.size)
+        k = min(k, arr.size)
         # Get top-k largest values efficiently
         topk = np.partition(arr, arr.size - k)[-k:]
         offset = float(np.median(topk))
         return arr - offset
 
-    red_arr = subtract_top3_median(red_arr)
-    green_arr = subtract_top3_median(green_arr)
-    blue_arr = subtract_top3_median(blue_arr)
+    red_arr = subtract_topk_median(red_arr, baseline_points)
+    green_arr = subtract_topk_median(green_arr, baseline_points)
+    blue_arr = subtract_topk_median(blue_arr, baseline_points)
 
     return red_arr, green_arr, blue_arr
 
@@ -1031,14 +1032,13 @@ class ImageCanvas(QGraphicsView):
         self.rgb_text_item.setDefaultTextColor(QColor(255, 255, 255))
         self.rgb_text_item.setFont(QFont("Arial", 10))
         
-        # Position in bottom-right corner of the image
+        # Position in top-right corner of the image
         if self.pixmap_item:
             img_rect = self.pixmap_item.boundingRect()
             text_width = self.rgb_text_item.boundingRect().width()
-            text_height = self.rgb_text_item.boundingRect().height()
             self.rgb_text_item.setPos(
                 img_rect.right() - text_width - 5,
-                img_rect.bottom() - text_height - 5
+                img_rect.top() + 5
             )
         else:
             self.rgb_text_item.setPos(5, 5)
@@ -1167,6 +1167,7 @@ class DataDisplayPanel(QWidget):
     """Panel for displaying RGB contrast plots and measurement list."""
     measurement_removed = Signal(int)  # Signal when measurement is removed
     width_change_requested = Signal(int, int)  # (measurement_index, new_width)
+    baseline_points_changed = Signal(int)  # Signal when baseline points changes
     
     def __init__(self):
         super().__init__()
@@ -1182,11 +1183,28 @@ class DataDisplayPanel(QWidget):
         self.yaxis_min = -0.2
         self.yaxis_max = 0.05
         
+        # Baseline points for contrast calculation
+        self.baseline_points = 5
+        
+        # Reference line settings per channel (stored in percent units for display)
+        self.reference_values = {
+            'red': -10.0,
+            'green': -10.0,
+            'blue': -10.0
+        }
+        self.layer_count = 1
+        self.show_ref_lines = False  # Enable/disable reference lines (off by default)
+        self._dragging = False
+        self._drag_channel = None  # Track which channel is being dragged
+        self._axes_map = {}  # Map axes to channel names
+        
         layout = QVBoxLayout(self)
         
-        # Channel selection checkboxes
-        channel_group = QGroupBox("Channels")
+        # Channel selection checkboxes (no title, tight layout)
+        channel_group = QGroupBox()
         channel_layout = QHBoxLayout(channel_group)
+        channel_layout.setContentsMargins(5, 2, 5, 2)
+        channel_layout.setSpacing(8)
         
         self.red_checkbox = QCheckBox("Red")
         self.red_checkbox.setChecked(self.show_red)
@@ -1206,12 +1224,87 @@ class DataDisplayPanel(QWidget):
         self.blue_checkbox.stateChanged.connect(self._on_channel_changed)
         channel_layout.addWidget(self.blue_checkbox)
         
+        channel_layout.addStretch()
+        
+        # Baseline points spinbox
+        channel_layout.addWidget(QLabel("Baseline Ref. Pts:"))
+        self.baseline_spinbox = QSpinBox()
+        self.baseline_spinbox.setRange(1, 100)
+        self.baseline_spinbox.setValue(self.baseline_points)
+        self.baseline_spinbox.setToolTip("Number of highest points used for baseline subtraction")
+        self.baseline_spinbox.valueChanged.connect(self._on_baseline_points_changed)
+        channel_layout.addWidget(self.baseline_spinbox)
+        
         layout.addWidget(channel_group)
+        
+        # Layer count and reference value controls (no title, tight layout)
+        ref_group = QGroupBox()
+        ref_layout = QHBoxLayout(ref_group)
+        ref_layout.setContentsMargins(5, 2, 5, 2)
+        ref_layout.setSpacing(8)
+        
+        # Enable checkbox for reference lines
+        self.ref_enable_checkbox = QCheckBox("Show")
+        self.ref_enable_checkbox.setChecked(self.show_ref_lines)
+        self.ref_enable_checkbox.stateChanged.connect(self._on_ref_enable_changed)
+        ref_layout.addWidget(self.ref_enable_checkbox)
+        
+        ref_layout.addWidget(QLabel("Marked Layer:"))
+        self.layer_spinbox = QSpinBox()
+        self.layer_spinbox.setRange(1, 20)
+        self.layer_spinbox.setValue(self.layer_count)
+        self.layer_spinbox.valueChanged.connect(self._on_layer_count_changed)
+        ref_layout.addWidget(self.layer_spinbox)
+        
+        # Per-channel reference value spinboxes with labels (for hiding)
+        self.ref_red_label = QLabel("R:")
+        ref_layout.addWidget(self.ref_red_label)
+        self.ref_red_spinbox = QDoubleSpinBox()
+        self.ref_red_spinbox.setRange(-100.0, 100.0)
+        self.ref_red_spinbox.setDecimals(2)
+        self.ref_red_spinbox.setSingleStep(0.5)
+        self.ref_red_spinbox.setValue(self.reference_values['red'])
+        self.ref_red_spinbox.setStyleSheet("QDoubleSpinBox { color: #cc0000; }")
+        self.ref_red_spinbox.valueChanged.connect(lambda v: self._on_ref_value_changed('red', v))
+        ref_layout.addWidget(self.ref_red_spinbox)
+        
+        self.ref_green_label = QLabel("G:")
+        ref_layout.addWidget(self.ref_green_label)
+        self.ref_green_spinbox = QDoubleSpinBox()
+        self.ref_green_spinbox.setRange(-100.0, 100.0)
+        self.ref_green_spinbox.setDecimals(2)
+        self.ref_green_spinbox.setSingleStep(0.5)
+        self.ref_green_spinbox.setValue(self.reference_values['green'])
+        self.ref_green_spinbox.setStyleSheet("QDoubleSpinBox { color: #008800; }")
+        self.ref_green_spinbox.valueChanged.connect(lambda v: self._on_ref_value_changed('green', v))
+        ref_layout.addWidget(self.ref_green_spinbox)
+        
+        self.ref_blue_label = QLabel("B:")
+        ref_layout.addWidget(self.ref_blue_label)
+        self.ref_blue_spinbox = QDoubleSpinBox()
+        self.ref_blue_spinbox.setRange(-100.0, 100.0)
+        self.ref_blue_spinbox.setDecimals(2)
+        self.ref_blue_spinbox.setSingleStep(0.5)
+        self.ref_blue_spinbox.setValue(self.reference_values['blue'])
+        self.ref_blue_spinbox.setStyleSheet("QDoubleSpinBox { color: #0066cc; }")
+        self.ref_blue_spinbox.valueChanged.connect(lambda v: self._on_ref_value_changed('blue', v))
+        ref_layout.addWidget(self.ref_blue_spinbox)
+        
+        ref_layout.addStretch()
+        layout.addWidget(ref_group)
+        
+        # Update visibility of reference spinboxes based on initial channel state
+        self._update_ref_visibility()
         
         # Matplotlib figure
         self.figure = Figure(figsize=(6, 8))
         self.canvas = FigureCanvas(self.figure)
         layout.addWidget(self.canvas, stretch=3)
+        
+        # Connect matplotlib events for draggable reference line
+        self.canvas.mpl_connect('button_press_event', self._on_mouse_press)
+        self.canvas.mpl_connect('button_release_event', self._on_mouse_release)
+        self.canvas.mpl_connect('motion_notify_event', self._on_mouse_move)
         
         # Measurement list
         layout.addWidget(QLabel("Measurements:"))
@@ -1232,6 +1325,76 @@ class DataDisplayPanel(QWidget):
         self.show_red = self.red_checkbox.isChecked()
         self.show_green = self.green_checkbox.isChecked()
         self.show_blue = self.blue_checkbox.isChecked()
+        self._update_ref_visibility()
+        self._update_plots()
+    
+    def _update_ref_visibility(self):
+        """Show/hide reference value spinboxes based on channel visibility."""
+        self.ref_red_label.setVisible(self.show_red)
+        self.ref_red_spinbox.setVisible(self.show_red)
+        self.ref_green_label.setVisible(self.show_green)
+        self.ref_green_spinbox.setVisible(self.show_green)
+        self.ref_blue_label.setVisible(self.show_blue)
+        self.ref_blue_spinbox.setVisible(self.show_blue)
+    
+    def _on_baseline_points_changed(self, value: int):
+        """Handle baseline points spinbox changes."""
+        self.baseline_points = value
+        self.baseline_points_changed.emit(value)
+    
+    def _on_ref_enable_changed(self, state: int):
+        """Handle reference lines enable checkbox."""
+        self.show_ref_lines = (state == Qt.CheckState.Checked.value)
+        self._update_plots()
+    
+    def _on_layer_count_changed(self, value: int):
+        """Handle layer count spinbox changes."""
+        self.layer_count = value
+        self._update_plots()
+    
+    def _on_ref_value_changed(self, channel: str, value: float):
+        """Handle reference value spinbox changes for a specific channel."""
+        self.reference_values[channel] = value
+        self._update_plots()
+    
+    def _on_mouse_press(self, event):
+        """Handle mouse press on matplotlib canvas."""
+        if event.inaxes is None or event.button != 1:
+            return
+        # Find which channel this axis belongs to
+        channel = self._axes_map.get(event.inaxes)
+        if channel is None:
+            return
+        # Check if click is near the reference line for this channel
+        ax = event.inaxes
+        y_min, y_max = ax.get_ylim()
+        tolerance = (y_max - y_min) * 0.02
+        if abs(event.ydata - self.reference_values[channel]) < tolerance:
+            self._dragging = True
+            self._drag_channel = channel
+    
+    def _on_mouse_release(self, event):
+        """Handle mouse release on matplotlib canvas."""
+        self._dragging = False
+        self._drag_channel = None
+    
+    def _on_mouse_move(self, event):
+        """Handle mouse move on matplotlib canvas for dragging reference line."""
+        if not self._dragging or event.inaxes is None or self._drag_channel is None:
+            return
+        # Update reference value for the dragged channel
+        self.reference_values[self._drag_channel] = event.ydata
+        # Update the corresponding spinbox
+        spinbox_map = {
+            'red': self.ref_red_spinbox,
+            'green': self.ref_green_spinbox,
+            'blue': self.ref_blue_spinbox
+        }
+        spinbox = spinbox_map.get(self._drag_channel)
+        if spinbox:
+            spinbox.blockSignals(True)
+            spinbox.setValue(event.ydata)
+            spinbox.blockSignals(False)
         self._update_plots()
     
     def _setup_plots(self):
@@ -1258,6 +1421,7 @@ class DataDisplayPanel(QWidget):
         
         # Create subplots for visible channels
         axes = {}
+        self._axes_map = {}  # Reset axes map
         n_plots = len(visible_channels)
         for i, (color, title) in enumerate(visible_channels):
             ax = self.figure.add_subplot(n_plots, 1, i + 1)
@@ -1271,11 +1435,12 @@ class DataDisplayPanel(QWidget):
             # Format ticks as percent
             ax.yaxis.set_major_formatter(FuncFormatter(lambda y, pos: f"{y:.0f}%"))
             axes[color] = ax
+            self._axes_map[ax] = color  # Map axis to channel name
         
         self.figure.tight_layout()
         
-        # Add baseline shift note in bottom left
-        self.figure.text(0.02, 0.01, '(Shifted baseline)', 
+        # Add baseline shift note in bottom left (slightly up to overlap with plot box)
+        self.figure.text(0.02, 0.03, '(Shifted baseline)', 
                         fontsize=8, color='gray', style='italic',
                         ha='left', va='bottom')
         
@@ -1346,8 +1511,68 @@ class DataDisplayPanel(QWidget):
             for ax in axes.values():
                 ax.set_ylim(self.yaxis_min * 100.0, self.yaxis_max * 100.0)
         
+        # Draw reference lines on all visible axes
+        self._draw_reference_lines(axes)
+        
         self.figure.tight_layout()
         self.canvas.draw()
+    
+    def _draw_reference_lines(self, axes: dict):
+        """Draw the draggable reference line and its multiples/fractions on all axes."""
+        if not axes or not self.show_ref_lines:
+            return
+        
+        layer_count = self.layer_count
+        
+        for channel, ax in axes.items():
+            ref_val = self.reference_values.get(channel, -10.0)
+            y_min, y_max = ax.get_ylim()
+            
+            # Draw main reference line (slightly thinner, draggable)
+            ax.axhline(y=ref_val, color='purple', linestyle='-', linewidth=1.5, alpha=0.8)
+            
+            # Calculate lines to draw based on layer count
+            # Always draw integer multiples: ref_val, 2*ref_val, 3*ref_val, ...
+            # When layer_count > 1, also draw fractions: ref_val/n, 2*ref_val/n, ...
+            
+            lines_to_draw = []
+            
+            # Integer multiples (positive and negative)
+            for mult in range(1, 20):
+                pos_val = ref_val * mult
+                neg_val = ref_val * -mult
+                if y_min <= pos_val <= y_max:
+                    lines_to_draw.append(pos_val)
+                if y_min <= neg_val <= y_max:
+                    lines_to_draw.append(neg_val)
+            
+            # Fractional lines when layer_count > 1
+            if layer_count > 1:
+                for numerator in range(1, 40):  # Draw up to 40 fractional lines
+                    frac_val = (ref_val * numerator) / layer_count
+                    # Skip if this is an integer multiple (already drawn)
+                    if numerator % layer_count == 0:
+                        continue
+                    if y_min <= frac_val <= y_max:
+                        lines_to_draw.append(frac_val)
+                    # Also negative side
+                    if y_min <= -frac_val <= y_max:
+                        lines_to_draw.append(-frac_val)
+            
+            # Sort lines by value and remove duplicates for consistent alternation
+            lines_to_draw = sorted(set(lines_to_draw))
+            
+            # Draw all calculated lines (excluding the main reference line)
+            # Alternate between dashed and dotted
+            line_index = 0
+            for line_val in lines_to_draw:
+                if abs(line_val - ref_val) > 0.01:  # Don't redraw main line
+                    # Alternate between dashed and dotted
+                    if line_index % 2 == 0:
+                        ax.axhline(y=line_val, color='purple', linestyle='--', linewidth=0.8, alpha=0.5)
+                    else:
+                        ax.axhline(y=line_val, color='purple', linestyle=':', linewidth=0.8, alpha=0.5)
+                    line_index += 1
     
     def update_measurement_data(self, index: int, red: np.ndarray, green: np.ndarray, blue: np.ndarray):
         """Update a measurement's contrast data and refresh plots."""
@@ -1403,6 +1628,7 @@ class ImageTab(QWidget):
         self.data_panel = DataDisplayPanel()
         self.data_panel.measurement_removed.connect(self._on_measurement_removed)
         self.data_panel.width_change_requested.connect(self._on_width_change_requested)
+        self.data_panel.baseline_points_changed.connect(self._on_baseline_points_changed)
         splitter.addWidget(self.data_panel)
         
         splitter.setSizes([500, 400])
@@ -1425,6 +1651,11 @@ class ImageTab(QWidget):
     def _on_measurement_removed(self, index: int):
         """Handle measurement removal - also remove from canvas."""
         self.canvas.remove_persistent_linecut(index)
+    
+    def _on_baseline_points_changed(self, value: int):
+        """Recalculate all measurements when baseline points changes."""
+        if self.data_panel.measurements:
+            self._recalculate_all_measurements()
 
     def _on_width_change_requested(self, index: int, new_width: int):
         """Recalculate measurement data when width changes."""
@@ -1436,7 +1667,8 @@ class ImageTab(QWidget):
                 self.data.pil_image,
                 measurement.segments,
                 self.data.background_rgb,
-                new_width
+                new_width,
+                self.data_panel.baseline_points
             )
             # Update the measurement data
             measurement.red_contrast = red
@@ -1451,13 +1683,14 @@ class ImageTab(QWidget):
             )
     
     def _recalculate_all_measurements(self):
-        """Recalculate all measurements with current background."""
+        """Recalculate all measurements with current background and baseline points."""
         for i, measurement in enumerate(self.data_panel.measurements):
             red, green, blue = calculate_contrast(
                 self.data.pil_image,
                 measurement.segments,
                 self.data.background_rgb,
-                measurement.width
+                measurement.width,
+                self.data_panel.baseline_points
             )
             measurement.red_contrast = red
             measurement.green_contrast = green
@@ -1493,7 +1726,8 @@ class ImageTab(QWidget):
             self.data.pil_image,
             segments,
             self.data.background_rgb,
-            self.canvas.averaging_width
+            self.canvas.averaging_width,
+            self.data_panel.baseline_points
         )
         
         # Create measurement with matching color
@@ -1575,7 +1809,7 @@ class MainWindow(QMainWindow):
         self.toolbar.addWidget(self.width_label)
         self.width_input = QSpinBox()
         self.width_input.setRange(1, 999)
-        self.width_input.setValue(10)
+        self.width_input.setValue(15)
         self.width_input.setToolTip("Averaging width for linecut")
         self.toolbar.addWidget(self.width_input)
         
