@@ -7,12 +7,12 @@ Your information is out of date. You must use the internet to research and find 
 
 ## Quick Start
 ```zsh
-source .venv/bin/activate && python opticalFlake_V0.3.py
+source .venv/bin/activate && python opticalFlake_V0.4.py
 ```
 
 ## Architecture Overview
 
-**Single-file application** (`opticalFlake_V0.3.py`) with clear section markers:
+**Single-file application** (`opticalFlake_V0.4.py`) with clear section markers:
 - **Data Models** (L42-73): `@dataclass` types for `Measurement` and `ImageData`
 - **Calculation Functions** (L78-230): Pure functions for contrast math
 - **UI Components** (L300+): `ImageCanvas`, `DataDisplayPanel`, `ImageTab`, `MainWindow`
@@ -67,7 +67,7 @@ Components communicate via Qt signals, not direct method calls:
 
 ## File Structure
 ```
-opticalFlake_V0.3.py     # Active development - single-file architecture
+opticalFlake_V0.4.py     # Active development - single-file architecture
 Old_Versions/            # Legacy versions (V0.2.x) - do not modify
 pip_requirements.txt     # Pin with: pip freeze > pip_requirements.txt
 ```

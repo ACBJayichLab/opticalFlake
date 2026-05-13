@@ -65,7 +65,7 @@ def build():
             cmd.append(f"--icon={icon_path}")
     
     # Add the main script
-    cmd.append("opticalFlake_V0.3.py")
+    cmd.append("opticalFlake_V0.4.py")
     
     print(f"\n{'='*60}")
     print(f"Building OpticalFlake for {system}")

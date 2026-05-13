@@ -1,4 +1,4 @@
-Version V0.3 will be a complete rewrite that won't necessarily use the same libraries. 
+Version V0.4 will be a complete rewrite that won't necessarily use the same libraries. 
 Currently the transparency behavior is broken on MacOS and in general the program is cludgy and poor quality.
 
 Update # copilot-instructions to reflect all of this. Remove specific details to the old implementation which are irrelevant

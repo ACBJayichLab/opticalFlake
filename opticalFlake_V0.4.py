@@ -1,5 +1,10 @@
+import sys
+
+print(sys.executable)
+print(sys.path)
+
 """
-opticalFlake V0.3 - Optical Flake Thickness Characterizer
+opticalFlake V0.4 - Optical Flake Thickness Characterizer
 
 A desktop tool for optical flake thickness characterization in materials science.
 Analyzes optical contrast of 2D materials (graphene flakes) by capturing screenshots,
@@ -1336,6 +1341,16 @@ class DataDisplayPanel(QWidget):
         self.baseline_spinbox.valueChanged.connect(self._on_baseline_points_changed)
         channel_layout.addWidget(self.baseline_spinbox)
 
+        self.ref_baseline_checkbox = QCheckBox("Calc Baseline")
+        self.ref_baseline_checkbox.setChecked(self.use_calculated_ref_baseline)
+        self.ref_baseline_checkbox.setToolTip(
+            "Use 0 when off. When on, use the median of the minimum baseline points."
+        )
+        self.ref_baseline_checkbox.stateChanged.connect(
+            self._on_ref_baseline_mode_changed
+        )
+        channel_layout.addWidget(self.ref_baseline_checkbox)
+
         layout.addWidget(channel_group)
 
         # Layer count and reference value controls (no title, tight layout)
@@ -1349,16 +1364,6 @@ class DataDisplayPanel(QWidget):
         self.ref_enable_checkbox.setChecked(self.show_ref_lines)
         self.ref_enable_checkbox.stateChanged.connect(self._on_ref_enable_changed)
         ref_layout.addWidget(self.ref_enable_checkbox)
-
-        self.ref_baseline_checkbox = QCheckBox("Calc Baseline")
-        self.ref_baseline_checkbox.setChecked(self.use_calculated_ref_baseline)
-        self.ref_baseline_checkbox.setToolTip(
-            "Use 0 when off. When on, use the median of the minimum baseline points."
-        )
-        self.ref_baseline_checkbox.stateChanged.connect(
-            self._on_ref_baseline_mode_changed
-        )
-        ref_layout.addWidget(self.ref_baseline_checkbox)
 
         ref_layout.addWidget(QLabel("Marked Layer:"))
         self.layer_spinbox = QSpinBox()
@@ -1980,7 +1985,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Optical Flake Thickness Characterizer V0.3")
+        self.setWindowTitle("Optical Flake Thickness Characterizer V0.4")
         self.setMinimumSize(1200, 800)
 
         # Track selection mode state

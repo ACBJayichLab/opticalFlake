@@ -1,4 +1,4 @@
-# opticalFlake V0.3 - Project Description
+# opticalFlake V0.4 - Project Description
 
 ## Program Structure
 

@@ -58,7 +58,7 @@ pip install -r requirements.txt
 
 ```bash
 source .venv/bin/activate  # or .venv\Scripts\activate on Windows
-python opticalFlake_V0.3.py
+python opticalFlake_V0.4.py
 ```
 
 ### Build Standalone Application
@@ -98,7 +98,7 @@ This creates:
 
 ```
 opticalFlake/
-├── opticalFlake_V0.3.py   # Main application
+├── opticalFlake_V0.4.py   # Main application
 ├── build_app.py           # PyInstaller build script
 ├── requirements.txt       # Python dependencies
 ├── Old_Versions/          # Previous versions
