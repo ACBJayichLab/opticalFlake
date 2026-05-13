@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 # IMPORTANT: Set matplotlib backend before importing PySide6
@@ -2154,6 +2155,10 @@ class MainWindow(QMainWindow):
 
     def _start_capture(self):
         """Start screen capture mode."""
+        if sys.platform == "darwin":
+            self._start_capture_macos_system_picker()
+            return
+
         self.hide()
         QApplication.processEvents()
 
@@ -2161,6 +2166,51 @@ class MainWindow(QMainWindow):
         from PySide6.QtCore import QTimer
 
         QTimer.singleShot(200, self._show_capture_overlay)
+
+    def _start_capture_macos_system_picker(self):
+        """Use native macOS interactive screenshot picker."""
+        self.hide()
+        QApplication.processEvents()
+
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
+                tmp_path = tmp_file.name
+
+            result = subprocess.run(["screencapture", "-i", "-x", tmp_path], check=False)
+            self.show()
+
+            if result.returncode != 0:
+                return
+
+            capture_path = Path(tmp_path)
+            if not capture_path.exists() or capture_path.stat().st_size == 0:
+                return
+
+            with Image.open(capture_path) as image:
+                pil_image = image.convert("RGB").copy()
+
+            img_data = pil_image.tobytes("raw", "RGB")
+            qimage = QImage(
+                img_data,
+                pil_image.width,
+                pil_image.height,
+                pil_image.width * 3,
+                QImage.Format.Format_RGB888,
+            )
+            pixmap = QPixmap.fromImage(qimage.copy())
+            self._create_tab_from_capture(pixmap, pil_image)
+        except Exception as e:
+            print(f"Error using macOS system capture: {e}")
+            self.show()
+            QMessageBox.warning(
+                self,
+                "Screen Capture Failed",
+                "Could not complete macOS system screen capture.",
+            )
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     def _show_capture_overlay(self):
         """Show the capture overlay after delay."""
@@ -2191,6 +2241,10 @@ class MainWindow(QMainWindow):
     def _on_capture_complete(self, pixmap: QPixmap, pil_image: Image.Image):
         """Handle completed screen capture."""
         self.show()
+        self._create_tab_from_capture(pixmap, pil_image)
+
+    def _create_tab_from_capture(self, pixmap: QPixmap, pil_image: Image.Image):
+        """Create a new image tab from captured image data."""
 
         # Create new tab
         tab = ImageTab(pixmap, pil_image)
