@@ -14,6 +14,10 @@ import sys
 import platform
 from pathlib import Path
 
+APP_VERSION = "V0.4"
+APP_NAME = f"OpticalFlake_{APP_VERSION}"
+MAIN_SCRIPT = f"opticalFlake_{APP_VERSION}.py"
+
 
 def check_pyinstaller():
     """Check if PyInstaller is installed, install if not."""
@@ -36,7 +40,7 @@ def build():
     # Base PyInstaller command
     cmd = [
         sys.executable, "-m", "PyInstaller",
-        "--name=OpticalFlake",
+        f"--name={APP_NAME}",
         "--windowed",  # No console window
         "--onefile",   # Single executable
         "--clean",     # Clean build
@@ -65,10 +69,10 @@ def build():
             cmd.append(f"--icon={icon_path}")
     
     # Add the main script
-    cmd.append("opticalFlake_V0.4.py")
+    cmd.append(MAIN_SCRIPT)
     
     print(f"\n{'='*60}")
-    print(f"Building OpticalFlake for {system}")
+    print(f"Building {APP_NAME} for {system}")
     print(f"{'='*60}\n")
     print("Command:", " ".join(cmd))
     print()
@@ -83,16 +87,16 @@ def build():
         
         dist_path = Path("dist")
         if system == "Darwin":
-            app_path = dist_path / "OpticalFlake.app"
-            exe_path = dist_path / "OpticalFlake"
+            app_path = dist_path / f"{APP_NAME}.app"
+            exe_path = dist_path / APP_NAME
             if app_path.exists():
                 print(f"\nApplication bundle: {app_path.absolute()}")
             elif exe_path.exists():
                 print(f"\nExecutable: {exe_path.absolute()}")
         elif system == "Windows":
-            print(f"\nExecutable: {dist_path / 'OpticalFlake.exe'}")
+            print(f"\nExecutable: {dist_path / f'{APP_NAME}.exe'}")
         else:
-            print(f"\nExecutable: {dist_path / 'OpticalFlake'}")
+            print(f"\nExecutable: {dist_path / APP_NAME}")
             
         print("\nNote: On macOS, the app needs Screen Recording permission.")
         print("Go to System Preferences > Privacy & Security > Screen Recording")

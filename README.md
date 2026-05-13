@@ -18,13 +18,13 @@ Desktop tool for optical flake thickness characterization in materials science. 
 ## Quick Start (Standalone App)
 
 ### macOS
-1. Download `OpticalFlake` from the [releases](../../releases)
+1. Download `OpticalFlake_V0.4` from the [releases](../../releases)
 2. Move to Applications folder
 3. On first run, grant **Screen Recording** permission:
    - System Settings → Privacy & Security → Screen Recording → Add OpticalFlake
 
 ### Windows
-1. Download `OpticalFlake.exe` from the [releases](../../releases)
+1. Download `OpticalFlake_V0.4.exe` from the [releases](../../releases)
 2. Run the executable
 
 ## Development Setup
@@ -68,8 +68,8 @@ python build_app.py
 ```
 
 This creates:
-- **macOS**: `dist/OpticalFlake` (executable)
-- **Windows**: `dist/OpticalFlake.exe`
+- **macOS**: `dist/OpticalFlake_V0.4` (executable)
+- **Windows**: `dist/OpticalFlake_V0.4.exe`
 
 ## Usage
 

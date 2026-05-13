@@ -14,7 +14,10 @@ Dependencies: PySide6, mss, numpy, matplotlib, pillow
 """
 
 import math
+import os
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -422,36 +425,73 @@ class ScreenCaptureOverlay(QWidget):
             # Create a new mss instance for each capture to avoid conflicts
             sct = mss.mss()
             try:
-                # Capture primary monitor (excludes menu bar on macOS)
-                monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+                # Capture all monitors as a single virtual desktop.
+                monitor = sct.monitors[0]
                 sct_img = sct.grab(monitor)
 
                 # Convert to PIL Image - copy the data immediately
-                self.pil_screenshot = Image.frombytes(
+                pil_capture = Image.frombytes(
                     "RGB",
                     (sct_img.width, sct_img.height),
                     bytes(sct_img.rgb),  # Convert to bytes to copy the data
                 )
-
-                # Convert to QPixmap for display - keep reference to img_data
-                self._img_data = self.pil_screenshot.tobytes("raw", "RGB")
-                qimage = QImage(
-                    self._img_data,
-                    self.pil_screenshot.width,
-                    self.pil_screenshot.height,
-                    self.pil_screenshot.width * 3,
-                    QImage.Format.Format_RGB888,
-                )
-                self.screenshot = QPixmap.fromImage(
-                    qimage.copy()
-                )  # Copy to own the data
             finally:
                 # Explicitly close mss to release resources
                 sct.close()
+
+            # mss can return an all-black frame on macOS in some permission/window states.
+            if sys.platform == "darwin" and self._is_black_capture(pil_capture):
+                fallback_capture = self._capture_screen_with_macos_tool()
+                if fallback_capture is None or self._is_black_capture(fallback_capture):
+                    raise RuntimeError("Unable to capture screen image on macOS")
+                pil_capture = fallback_capture
+
+            self._set_screenshot_from_pil(pil_capture)
         except Exception as e:
             print(f"Screen capture error: {e}")
             self.screenshot = None
             self.pil_screenshot = None
+
+    @staticmethod
+    def _is_black_capture(image: Image.Image) -> bool:
+        """Return True when an RGB capture is fully black."""
+        extrema = image.getextrema()
+        return all(channel_min == 0 and channel_max == 0 for channel_min, channel_max in extrema)
+
+    def _capture_screen_with_macos_tool(self) -> Optional[Image.Image]:
+        """Fallback capture for macOS using the native screencapture tool."""
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
+                tmp_path = tmp_file.name
+
+            subprocess.run(
+                ["screencapture", "-x", tmp_path],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            with Image.open(tmp_path) as image:
+                return image.convert("RGB").copy()
+        except Exception as e:
+            print(f"macOS screencapture fallback failed: {e}")
+            return None
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def _set_screenshot_from_pil(self, image: Image.Image):
+        """Populate PIL/QPixmap screenshot state from a PIL image."""
+        self.pil_screenshot = image
+        self._img_data = self.pil_screenshot.tobytes("raw", "RGB")
+        qimage = QImage(
+            self._img_data,
+            self.pil_screenshot.width,
+            self.pil_screenshot.height,
+            self.pil_screenshot.width * 3,
+            QImage.Format.Format_RGB888,
+        )
+        self.screenshot = QPixmap.fromImage(qimage.copy())
 
     def paintEvent(self, event):
         """Draw the screenshot with selection rectangle overlay."""
@@ -1730,7 +1770,11 @@ class DataDisplayPanel(QWidget):
             ref_color = "purple"
 
             def _draw_line_with_label(
-                line_y: float, linestyle: str, linewidth: float, alpha: float
+                line_y: float,
+                delta_value: float,
+                linestyle: str,
+                linewidth: float,
+                alpha: float,
             ):
                 ax.axhline(
                     y=line_y,
@@ -1745,7 +1789,7 @@ class DataDisplayPanel(QWidget):
                 ax.text(
                     x_text,
                     label_y,
-                    f"{line_y:.2f}%",
+                    f"\u0394={delta_value:.2f}",
                     color=ref_color,
                     fontsize=7,
                     ha="left",
@@ -1759,7 +1803,7 @@ class DataDisplayPanel(QWidget):
                 )
 
             # Draw main reference line (slightly thinner, draggable)
-            _draw_line_with_label(main_ref_line, "-", 1.5, 0.8)
+            _draw_line_with_label(main_ref_line, ref_val, "-", 1.5, 0.8)
 
             # Calculate lines to draw based on layer count
             # Always draw integer multiples: ref_val, 2*ref_val, 3*ref_val, ...
@@ -1797,9 +1841,13 @@ class DataDisplayPanel(QWidget):
                         continue
                     # Alternate between dashed and dotted
                     if line_index % 2 == 0:
-                        _draw_line_with_label(absolute_line, "--", 0.8, 0.5)
+                        _draw_line_with_label(
+                            absolute_line, line_val, "--", 0.8, 0.5
+                        )
                     else:
-                        _draw_line_with_label(absolute_line, ":", 0.8, 0.5)
+                        _draw_line_with_label(
+                            absolute_line, line_val, ":", 0.8, 0.5
+                        )
                     line_index += 1
 
     def update_measurement_data(
@@ -2124,6 +2172,14 @@ class MainWindow(QMainWindow):
                 self.capture_overlay.close()
                 self.capture_overlay = None
                 self.show()
+                if sys.platform == "darwin":
+                    QMessageBox.warning(
+                        self,
+                        "Screen Capture Failed",
+                        "Could not capture the screen.\n\n"
+                        "Check macOS Screen Recording permission for this app/terminal "
+                        "in System Settings > Privacy & Security > Screen Recording.",
+                    )
                 return
             self.capture_overlay.capture_complete.connect(self._on_capture_complete)
             self.capture_overlay.destroyed.connect(self._on_capture_cancelled)
