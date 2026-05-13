@@ -19,7 +19,7 @@ source .venv/bin/activate && python opticalFlake_V0.3.py
 
 ### Core Formula
 ```python
-contrast = (sample_RGB - background_RGB) / background_RGB  # per-pixel along linecut
+contrast = (background_RGB-sample_RGB) / (background_RGB+sample_RGB)  # per-pixel along linecut
 ```
 
 ### Key Algorithms (don't modify without understanding)

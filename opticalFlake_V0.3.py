@@ -1276,16 +1276,18 @@ class DataDisplayPanel(QWidget):
         self.yaxis_min = -0.18
         self.yaxis_max = 0.05
 
-        # Baseline points for contrast calculation
+        # Number of points used for calculated reference-line baseline
         self.baseline_points = 25
 
         # Reference line settings per channel (stored in percent units for display)
-        self.reference_values = {"red": -5.0, "green": -15.0, "blue": -10.0}
+        self.reference_values = {"red": 5.0, "green": 15.0, "blue": 10.0}
         self.layer_count = 1
         self.show_ref_lines = True  # Enable/disable reference lines (off by default)
+        self.use_calculated_ref_baseline = False  # False uses 0 as the baseline
         self._dragging = False
         self._drag_channel = None  # Track which channel is being dragged
         self._axes_map = {}  # Map axes to channel names
+        self._reference_baselines = {}  # Calculated baseline per channel (%)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)  # No margins for main layout
@@ -1329,7 +1331,7 @@ class DataDisplayPanel(QWidget):
         self.baseline_spinbox.setRange(1, 200)
         self.baseline_spinbox.setValue(self.baseline_points)
         self.baseline_spinbox.setToolTip(
-            "Number of highest points used for baseline subtraction"
+            "Number of minimum points used to calculate the reference-line baseline"
         )
         self.baseline_spinbox.valueChanged.connect(self._on_baseline_points_changed)
         channel_layout.addWidget(self.baseline_spinbox)
@@ -1347,6 +1349,16 @@ class DataDisplayPanel(QWidget):
         self.ref_enable_checkbox.setChecked(self.show_ref_lines)
         self.ref_enable_checkbox.stateChanged.connect(self._on_ref_enable_changed)
         ref_layout.addWidget(self.ref_enable_checkbox)
+
+        self.ref_baseline_checkbox = QCheckBox("Calc Baseline")
+        self.ref_baseline_checkbox.setChecked(self.use_calculated_ref_baseline)
+        self.ref_baseline_checkbox.setToolTip(
+            "Use 0 when off. When on, use the median of the minimum baseline points."
+        )
+        self.ref_baseline_checkbox.stateChanged.connect(
+            self._on_ref_baseline_mode_changed
+        )
+        ref_layout.addWidget(self.ref_baseline_checkbox)
 
         ref_layout.addWidget(QLabel("Marked Layer:"))
         self.layer_spinbox = QSpinBox()
@@ -1452,6 +1464,11 @@ class DataDisplayPanel(QWidget):
         self.show_ref_lines = state == Qt.CheckState.Checked.value
         self._update_plots()
 
+    def _on_ref_baseline_mode_changed(self, state: int):
+        """Handle calculated baseline toggle for reference lines."""
+        self.use_calculated_ref_baseline = state == Qt.CheckState.Checked.value
+        self._update_plots()
+
     def _on_layer_count_changed(self, value: int):
         """Handle layer count spinbox changes."""
         self.layer_count = value
@@ -1474,7 +1491,10 @@ class DataDisplayPanel(QWidget):
         ax = event.inaxes
         y_min, y_max = ax.get_ylim()
         tolerance = (y_max - y_min) * 0.02
-        if abs(event.ydata - self.reference_values[channel]) < tolerance:
+        displayed_ref = self.reference_values[channel] + self._reference_baselines.get(
+            channel, 0.0
+        )
+        if abs(event.ydata - displayed_ref) < tolerance:
             self._dragging = True
             self._drag_channel = channel
 
@@ -1487,8 +1507,9 @@ class DataDisplayPanel(QWidget):
         """Handle mouse move on matplotlib canvas for dragging reference line."""
         if not self._dragging or event.inaxes is None or self._drag_channel is None:
             return
-        # Update reference value for the dragged channel
-        self.reference_values[self._drag_channel] = event.ydata
+        # Keep stored reference values relative to the active baseline.
+        baseline = self._reference_baselines.get(self._drag_channel, 0.0)
+        ref_value = event.ydata - baseline
         # Update the corresponding spinbox
         spinbox_map = {
             "red": self.ref_red_spinbox,
@@ -1498,8 +1519,10 @@ class DataDisplayPanel(QWidget):
         spinbox = spinbox_map.get(self._drag_channel)
         if spinbox:
             spinbox.blockSignals(True)
-            spinbox.setValue(event.ydata)
+            spinbox.setValue(ref_value)
+            ref_value = spinbox.value()
             spinbox.blockSignals(False)
+        self.reference_values[self._drag_channel] = ref_value
         self._update_plots()
 
     def _setup_plots(self):
@@ -1551,17 +1574,17 @@ class DataDisplayPanel(QWidget):
         # Use tight_layout with padding to prevent overlap
         self.figure.tight_layout(pad=1.0, h_pad=1.5)
 
-        # Add baseline shift note in bottom left (slightly up to overlap with plot box)
-        self.figure.text(
-            0.02,
-            0.03,
-            "(Shifted baseline)",
-            fontsize=8,
-            color="gray",
-            style="italic",
-            ha="left",
-            va="bottom",
-        )
+        if self.use_calculated_ref_baseline:
+            self.figure.text(
+                0.02,
+                0.03,
+                "(Reference lines use calculated baseline)",
+                fontsize=8,
+                color="gray",
+                style="italic",
+                ha="left",
+                va="bottom",
+            )
 
         return axes
 
@@ -1594,6 +1617,33 @@ class DataDisplayPanel(QWidget):
         """Request recalculation with new width (actual update happens in ImageTab)."""
         if 0 <= index < len(self.measurements):
             self.width_change_requested.emit(index, new_width)
+
+    def refresh_plots(self):
+        """Refresh plots without changing measurement data."""
+        self._update_plots()
+
+    def _get_reference_baseline(self, channel: str) -> float:
+        """Calculate per-channel baseline from the minimum configured points."""
+        if not self.use_calculated_ref_baseline:
+            return 0.0
+
+        channel_data = []
+        attr_name = f"{channel}_contrast"
+        for measurement in self.measurements:
+            contrast_data = getattr(measurement, attr_name, None)
+            if contrast_data is not None and len(contrast_data) > 0:
+                channel_data.append(contrast_data * 100.0)
+
+        if not channel_data:
+            return 0.0
+
+        values = np.concatenate(channel_data)
+        if values.size == 0:
+            return 0.0
+
+        k = min(self.baseline_points, values.size)
+        min_points = np.partition(values, k - 1)[:k]
+        return float(np.median(min_points))
 
     def _update_plots(self):
         """Redraw all plots with current measurements."""
@@ -1657,18 +1707,54 @@ class DataDisplayPanel(QWidget):
     def _draw_reference_lines(self, axes: dict):
         """Draw the draggable reference line and its multiples/fractions on all axes."""
         if not axes or not self.show_ref_lines:
+            self._reference_baselines = {}
             return
 
         layer_count = self.layer_count
+        self._reference_baselines = {}
 
         for channel, ax in axes.items():
+            baseline = self._get_reference_baseline(channel)
+            self._reference_baselines[channel] = baseline
             ref_val = self.reference_values.get(channel, -10.0)
+            main_ref_line = baseline + ref_val
             y_min, y_max = ax.get_ylim()
+            x_min, x_max = ax.get_xlim()
+            y_offset = (y_max - y_min) * 0.01
+            x_text = x_min + (x_max - x_min) * 0.01
+            ref_color = "purple"
+
+            def _draw_line_with_label(
+                line_y: float, linestyle: str, linewidth: float, alpha: float
+            ):
+                ax.axhline(
+                    y=line_y,
+                    color=ref_color,
+                    linestyle=linestyle,
+                    linewidth=linewidth,
+                    alpha=alpha,
+                )
+                label_y = line_y + y_offset
+                if label_y > y_max:
+                    label_y = line_y - y_offset
+                ax.text(
+                    x_text,
+                    label_y,
+                    f"{line_y:.2f}%",
+                    color=ref_color,
+                    fontsize=7,
+                    ha="left",
+                    va="bottom",
+                    bbox={
+                        "facecolor": "white",
+                        "edgecolor": "none",
+                        "alpha": 0.65,
+                        "boxstyle": "round,pad=0.15",
+                    },
+                )
 
             # Draw main reference line (slightly thinner, draggable)
-            ax.axhline(
-                y=ref_val, color="purple", linestyle="-", linewidth=1.5, alpha=0.8
-            )
+            _draw_line_with_label(main_ref_line, "-", 1.5, 0.8)
 
             # Calculate lines to draw based on layer count
             # Always draw integer multiples: ref_val, 2*ref_val, 3*ref_val, ...
@@ -1680,10 +1766,8 @@ class DataDisplayPanel(QWidget):
             for mult in range(1, 20):
                 pos_val = ref_val * mult
                 neg_val = ref_val * -mult
-                if y_min <= pos_val <= y_max:
-                    lines_to_draw.append(pos_val)
-                if y_min <= neg_val <= y_max:
-                    lines_to_draw.append(neg_val)
+                lines_to_draw.append(pos_val)
+                lines_to_draw.append(neg_val)
 
             # Fractional lines when layer_count > 1
             if layer_count > 1:
@@ -1692,11 +1776,8 @@ class DataDisplayPanel(QWidget):
                     # Skip if this is an integer multiple (already drawn)
                     if numerator % layer_count == 0:
                         continue
-                    if y_min <= frac_val <= y_max:
-                        lines_to_draw.append(frac_val)
-                    # Also negative side
-                    if y_min <= -frac_val <= y_max:
-                        lines_to_draw.append(-frac_val)
+                    lines_to_draw.append(frac_val)
+                    lines_to_draw.append(-frac_val)
 
             # Sort lines by value and remove duplicates for consistent alternation
             lines_to_draw = sorted(set(lines_to_draw))
@@ -1706,23 +1787,14 @@ class DataDisplayPanel(QWidget):
             line_index = 0
             for line_val in lines_to_draw:
                 if abs(line_val - ref_val) > 0.01:  # Don't redraw main line
+                    absolute_line = baseline + line_val
+                    if not (y_min <= absolute_line <= y_max):
+                        continue
                     # Alternate between dashed and dotted
                     if line_index % 2 == 0:
-                        ax.axhline(
-                            y=line_val,
-                            color="purple",
-                            linestyle="--",
-                            linewidth=0.8,
-                            alpha=0.5,
-                        )
+                        _draw_line_with_label(absolute_line, "--", 0.8, 0.5)
                     else:
-                        ax.axhline(
-                            y=line_val,
-                            color="purple",
-                            linestyle=":",
-                            linewidth=0.8,
-                            alpha=0.5,
-                        )
+                        _draw_line_with_label(absolute_line, ":", 0.8, 0.5)
                     line_index += 1
 
     def update_measurement_data(
@@ -1809,9 +1881,8 @@ class ImageTab(QWidget):
         self.canvas.remove_persistent_linecut(index)
 
     def _on_baseline_points_changed(self, value: int):
-        """Recalculate all measurements when baseline points changes."""
-        if self.data_panel.measurements:
-            self._recalculate_all_measurements()
+        """Refresh reference lines when baseline points changes."""
+        self.data_panel.refresh_plots()
 
     def _on_width_change_requested(self, index: int, new_width: int):
         """Recalculate measurement data when width changes."""
@@ -1970,7 +2041,7 @@ class MainWindow(QMainWindow):
         self.toolbar.addWidget(self.width_label)
         self.width_input = QSpinBox()
         self.width_input.setRange(1, 999)
-        self.width_input.setValue(15)
+        self.width_input.setValue(20)
         self.width_input.setToolTip("Averaging width for linecut")
         self.toolbar.addWidget(self.width_input)
 
@@ -1987,8 +2058,8 @@ class MainWindow(QMainWindow):
         self.toolbar.addWidget(self.yaxis_min_label)
         self.yaxis_min_input = QDoubleSpinBox()
         self.yaxis_min_input.setRange(-10.0, 10.0)
-        self.yaxis_min_input.setValue(-0.2)
-        self.yaxis_min_input.setSingleStep(0.1)
+        self.yaxis_min_input.setValue(-0.05)
+        self.yaxis_min_input.setSingleStep(0.105)
         self.yaxis_min_input.setDecimals(2)
         self.yaxis_min_input.setToolTip("Minimum Y-axis value")
         self.yaxis_min_input.valueChanged.connect(self._on_yaxis_settings_changed)
@@ -1998,8 +2069,8 @@ class MainWindow(QMainWindow):
         self.toolbar.addWidget(self.yaxis_max_label)
         self.yaxis_max_input = QDoubleSpinBox()
         self.yaxis_max_input.setRange(-10.0, 10.0)
-        self.yaxis_max_input.setValue(0.05)
-        self.yaxis_max_input.setSingleStep(0.1)
+        self.yaxis_max_input.setValue(0.18)
+        self.yaxis_max_input.setSingleStep(0.05)
         self.yaxis_max_input.setDecimals(2)
         self.yaxis_max_input.setToolTip("Maximum Y-axis value")
         self.yaxis_max_input.valueChanged.connect(self._on_yaxis_settings_changed)
