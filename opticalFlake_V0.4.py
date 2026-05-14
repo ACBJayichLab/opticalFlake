@@ -457,7 +457,10 @@ class ScreenCaptureOverlay(QWidget):
     def _is_black_capture(image: Image.Image) -> bool:
         """Return True when an RGB capture is fully black."""
         extrema = image.getextrema()
-        return all(channel_min == 0 and channel_max == 0 for channel_min, channel_max in extrema)
+        return all(
+            channel_min == 0 and channel_max == 0
+            for channel_min, channel_max in extrema
+        )
 
     def _capture_screen_with_macos_tool(self) -> Optional[Image.Image]:
         """Fallback capture for macOS using the native screencapture tool."""
@@ -1762,6 +1765,7 @@ class DataDisplayPanel(QWidget):
         for channel, ax in axes.items():
             baseline = self._get_reference_baseline(channel)
             self._reference_baselines[channel] = baseline
+            ax.axhline(y=baseline, color="gray", linestyle="-", linewidth=1)
             ref_val = self.reference_values.get(channel, -10.0)
             main_ref_line = baseline + ref_val
             y_min, y_max = ax.get_ylim()
@@ -1842,13 +1846,9 @@ class DataDisplayPanel(QWidget):
                         continue
                     # Alternate between dashed and dotted
                     if line_index % 2 == 0:
-                        _draw_line_with_label(
-                            absolute_line, line_val, "--", 0.8, 0.5
-                        )
+                        _draw_line_with_label(absolute_line, line_val, "--", 0.8, 0.5)
                     else:
-                        _draw_line_with_label(
-                            absolute_line, line_val, ":", 0.8, 0.5
-                        )
+                        _draw_line_with_label(absolute_line, line_val, ":", 0.8, 0.5)
                     line_index += 1
 
     def update_measurement_data(
@@ -2172,12 +2172,21 @@ class MainWindow(QMainWindow):
         self.hide()
         QApplication.processEvents()
 
+        # Give macOS compositor time to remove this window before capture starts.
+        from PySide6.QtCore import QTimer
+
+        QTimer.singleShot(200, self._run_macos_system_picker)
+
+    def _run_macos_system_picker(self):
+        """Run native macOS interactive screenshot picker."""
         tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
                 tmp_path = tmp_file.name
 
-            result = subprocess.run(["screencapture", "-i", "-x", tmp_path], check=False)
+            result = subprocess.run(
+                ["screencapture", "-i", "-x", tmp_path], check=False
+            )
             self.show()
 
             if result.returncode != 0:
