@@ -14,7 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-APP_VERSION = "V0.4.1"
+APP_VERSION = "V0.4.2"
 APP_NAME = f"OpticalFlake_{APP_VERSION}"
 MAIN_SCRIPT = f"opticalFlake_{APP_VERSION}.py"
 
@@ -79,7 +79,7 @@ def build():
         "PyInstaller",
         f"--name={APP_NAME}",
         "--windowed",  # No console window
-        "--onefile",  # Single executable
+        "--onedir",  # Single executable
         "--clean",  # Clean build
         # Hidden imports needed for PySide6/matplotlib
         "--hidden-import=PIL._tkinter_finder",

@@ -2034,8 +2034,12 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Optical Flake Thickness Characterizer V0.4")
-        self.setMinimumSize(1200, 800)
+        self.setWindowTitle("Optical Flake Thickness Characterizer V0.4.2")
+        # macOS Split View requires the app window to be resizable to about half-screen.
+        if sys.platform == "darwin":
+            self.setMinimumSize(700, 500)
+        else:
+            self.setMinimumSize(1200, 800)
 
         # Track selection mode state
         self._in_selection_mode = False
