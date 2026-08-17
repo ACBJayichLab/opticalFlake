@@ -23,6 +23,10 @@ ENV/
 *.swp
 *.swo
 
+# Claude Code — share settings.json and skills, keep local overrides out
+.claude/settings.local.json
+CLAUDE.local.md
+
 # OS
 .DS_Store
 Thumbs.db
