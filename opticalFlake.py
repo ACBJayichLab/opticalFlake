@@ -4,7 +4,7 @@ print(sys.executable)
 print(sys.path)
 
 """
-opticalFlake V0.4 - Optical Flake Thickness Characterizer
+opticalFlake - Optical Flake Thickness Characterizer
 
 A desktop tool for optical flake thickness characterization in materials science.
 Analyzes optical contrast of 2D materials (graphene flakes) by capturing screenshots,
@@ -13,6 +13,8 @@ defining background regions, and computing RGB contrast along line cuts.
 Dependencies: PySide6, mss, numpy, matplotlib, pillow
 """
 
+import copy
+import json
 import math
 import os
 import subprocess
@@ -32,9 +34,10 @@ import mss
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from matplotlib.ticker import FuncFormatter, MaxNLocator
+from matplotlib.ticker import MaxNLocator, PercentFormatter
+from matplotlib.transforms import blended_transform_factory
 from PIL import Image, ImageDraw
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -48,6 +51,9 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QGraphicsEllipseItem,
     QGraphicsLineItem,
@@ -58,7 +64,9 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -70,6 +78,12 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+# The one place the version is written. The window title and the bundle name
+# both derive from it: build_app.py reads this literal out of the source rather
+# than keeping its own copy, and tools/smoke_test.py fails if the app, the build
+# script and the README drift apart. Bumping a release is this line alone.
+APP_VERSION = "V0.5.0"
 
 # =============================================================================
 # Data Models
@@ -102,6 +116,13 @@ MEASUREMENT_COLORS = [
     "#BB8FCE",  # Light purple
     "#85C1E9",  # Light blue
 ]
+
+# Plot chrome colors. These are deliberately distinct from each other, from the
+# purple reference lines, and from every MEASUREMENT_COLORS entry, so the grid,
+# the zero line and the calculated baseline never read as the same element.
+GRID_COLOR = "#d9d9d9"  # Faint dotted grid, drawn behind the data
+ZERO_LINE_COLOR = "#9a9a9a"  # Thin solid line at y=0
+BASELINE_COLOR = "#d95f02"  # Dashed calculated baseline (Brewer Dark2 orange)
 
 
 @dataclass
@@ -373,6 +394,431 @@ def calculate_contrast(
     # blue_arr = subtract_topk_median(blue_arr, baseline_points)
 
     return red_arr, green_arr, blue_arr
+
+
+# =============================================================================
+# Settings Persistence
+# =============================================================================
+
+CONFIG_SCHEMA_VERSION = 2
+CONFIG_DIR_NAME = "OpticalFlake"
+CONFIG_FILE_NAME = "settings.json"
+
+CHANNEL_NAMES = ("red", "green", "blue")
+
+# Materials seeded on first run. These are ordinary presets, not a read-only
+# layer: the user can edit, rename or delete them like any other. A preset only
+# records the channels it actually knows about, so these omit blue.
+BUILTIN_MATERIALS = [
+    {"name": "NiPS3", "reference_values": {"red": 2.35, "green": 7.4}, "layer_count": 1},
+    {"name": "CrSBr", "reference_values": {"red": 4.45, "green": 15.5}, "layer_count": 1},
+    {"name": "Graphene", "reference_values": {"green": 3.0}, "layer_count": 1},
+]
+
+# The schema-1 built-in values, kept so the migration can tell an untouched
+# preset (safe to refresh) from one the user edited (must be left alone).
+V1_BUILTIN_VALUES = {
+    "NiPS3": {"red": 2.25, "green": 7.5},
+    "CrSBr": {"red": 4.0, "green": 15.0},
+}
+
+# Panel/toolbar state carried into new tabs and remembered between launches.
+DEFAULT_LAST_USED = {
+    "show_red": True,
+    "show_green": True,
+    "show_blue": False,
+    "baseline_points": 25,
+    "use_calculated_ref_baseline": False,
+    "show_ref_lines": True,
+    "layer_count": 1,
+    "reference_values": {"red": 5.0, "green": 15.0, "blue": 10.0},
+    "material": None,
+    "use_fixed_yaxis": False,
+    "yaxis_min": -0.05,
+    "yaxis_max": 0.18,
+    "linecut_width": 20,
+}
+
+
+def default_config() -> dict:
+    """Build a fresh config seeded with the built-in materials.
+
+    Returns:
+        A new config dict; callers may mutate it freely.
+    """
+    return {
+        "schema_version": CONFIG_SCHEMA_VERSION,
+        "materials": copy.deepcopy(BUILTIN_MATERIALS),
+        "last_used": copy.deepcopy(DEFAULT_LAST_USED),
+    }
+
+
+def get_config_path() -> Path:
+    """Locate the writable per-user settings file for this platform.
+
+    Never points inside the application bundle, which is read-only when frozen.
+
+    Returns:
+        Absolute path to the settings JSON file (may not exist yet).
+    """
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    elif sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else Path.home()
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / CONFIG_DIR_NAME / CONFIG_FILE_NAME
+
+
+def _clean_material(raw) -> Optional[dict]:
+    """Coerce one stored material entry into a valid preset.
+
+    Args:
+        raw: Untrusted value read from the config file.
+
+    Returns:
+        A normalized material dict, or None if it cannot be salvaged.
+    """
+    if not isinstance(raw, dict):
+        return None
+    name = raw.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+
+    # reference_values is a partial map: a channel may be absent, which means
+    # the preset says nothing about it and leaves that spinbox alone.
+    values = {}
+    raw_values = raw.get("reference_values")
+    if isinstance(raw_values, dict):
+        for channel in CHANNEL_NAMES:
+            value = raw_values.get(channel)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                values[channel] = float(value)
+
+    layer_count = raw.get("layer_count", 1)
+    if not isinstance(layer_count, int) or isinstance(layer_count, bool):
+        layer_count = 1
+
+    return {
+        "name": name.strip(),
+        "reference_values": values,
+        "layer_count": max(1, layer_count),
+    }
+
+
+def _migrate_materials(materials: list, stored_version: int) -> list:
+    """Bring a stored material list up to the current schema version.
+
+    Schema 1 -> 2 refreshes the built-in reference values, but only for presets
+    the user never touched: a NiPS3 or CrSBr still holding its schema-1 values is
+    replaced, an edited one is kept as-is. Built-ins that are new in this version
+    are added; built-ins that already existed in schema 1 are never re-added,
+    because a missing one means the user deleted it on purpose.
+
+    Args:
+        materials: Cleaned presets read from the config file.
+        stored_version: schema_version found in the file (1 if absent).
+
+    Returns:
+        The migrated list; the input is not mutated.
+    """
+    if stored_version >= CONFIG_SCHEMA_VERSION:
+        return materials
+
+    migrated = []
+    for material in materials:
+        legacy_values = V1_BUILTIN_VALUES.get(material["name"])
+        if legacy_values is not None and material["reference_values"] == legacy_values:
+            builtin = next(
+                b for b in BUILTIN_MATERIALS if b["name"] == material["name"]
+            )
+            migrated.append(copy.deepcopy(builtin))
+        else:
+            migrated.append(material)
+
+    existing = {m["name"] for m in migrated}
+    for builtin in BUILTIN_MATERIALS:
+        if builtin["name"] not in existing and builtin["name"] not in V1_BUILTIN_VALUES:
+            migrated.append(copy.deepcopy(builtin))
+
+    return migrated
+
+
+def _clean_last_used(raw) -> dict:
+    """Merge stored panel settings over the defaults, dropping bad values.
+
+    Args:
+        raw: Untrusted value read from the config file.
+
+    Returns:
+        A complete settings dict with every expected key present.
+    """
+    settings = copy.deepcopy(DEFAULT_LAST_USED)
+    if not isinstance(raw, dict):
+        return settings
+
+    for key, default in DEFAULT_LAST_USED.items():
+        if key not in raw:
+            continue
+        value = raw[key]
+        if key == "reference_values":
+            if isinstance(value, dict):
+                for channel in CHANNEL_NAMES:
+                    channel_value = value.get(channel)
+                    if isinstance(channel_value, (int, float)) and not isinstance(
+                        channel_value, bool
+                    ):
+                        settings[key][channel] = float(channel_value)
+        elif key == "material":
+            if value is None or isinstance(value, str):
+                settings[key] = value
+        elif isinstance(default, bool):
+            if isinstance(value, bool):
+                settings[key] = value
+        elif isinstance(default, int):
+            if isinstance(value, int) and not isinstance(value, bool):
+                settings[key] = value
+        elif isinstance(default, float):
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                settings[key] = float(value)
+
+    return settings
+
+
+def load_config(path: Optional[Path] = None) -> dict:
+    """Read the settings file, falling back to defaults on any problem.
+
+    This never raises: it runs during window construction, and a corrupt or
+    unreadable config must not prevent the app from starting.
+
+    Args:
+        path: Config file to read. Defaults to get_config_path().
+
+    Returns:
+        A complete config dict with schema_version, materials and last_used.
+    """
+    target = Path(path) if path is not None else get_config_path()
+    try:
+        with open(target, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        # Missing or corrupt file: start from the seeded defaults.
+        return default_config()
+
+    if not isinstance(raw, dict):
+        return default_config()
+
+    config = default_config()
+    config["last_used"] = _clean_last_used(raw.get("last_used"))
+
+    # An existing file is authoritative about materials, including an empty
+    # list - otherwise deleting a built-in would silently resurrect it.
+    raw_materials = raw.get("materials")
+    if isinstance(raw_materials, list):
+        materials = []
+        seen = set()
+        for entry in raw_materials:
+            material = _clean_material(entry)
+            if material is not None and material["name"] not in seen:
+                seen.add(material["name"])
+                materials.append(material)
+
+        stored_version = raw.get("schema_version")
+        if not isinstance(stored_version, int) or isinstance(stored_version, bool):
+            stored_version = 1
+        migrated = _migrate_materials(materials, stored_version)
+        config["materials"] = migrated
+        if migrated != materials or stored_version != CONFIG_SCHEMA_VERSION:
+            # Write the new schema back so the migration runs once. save_config
+            # never raises, so an unwritable config just migrates again later.
+            save_config(config, target)
+
+    return config
+
+
+def save_config(config: dict, path: Optional[Path] = None) -> bool:
+    """Write the settings file atomically.
+
+    This never raises; a read-only home directory degrades to "settings are not
+    remembered" rather than crashing the app.
+
+    Args:
+        config: Config dict to persist.
+        path: Destination file. Defaults to get_config_path().
+
+    Returns:
+        True if the file was written.
+    """
+    target = Path(path) if path is not None else get_config_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Write beside the target so os.replace stays on one filesystem.
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=target.name,
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = handle.name
+            json.dump(config, handle, indent=2)
+        os.replace(temp_path, target)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+class MaterialStore(QObject):
+    """Shared, persisted collection of material presets.
+
+    One instance is owned by MainWindow and handed to every panel. Panels
+    subscribe to `changed` rather than reaching into each other, so a preset
+    saved in one tab shows up in every other tab's dropdown.
+    """
+
+    changed = Signal()
+    renamed = Signal(str, str)  # (old_name, new_name), emitted before `changed`
+
+    def __init__(self, config: dict, path: Optional[Path] = None):
+        super().__init__()
+        self._config = config
+        self._path = path
+
+    def _persist(self):
+        """Write the config and notify subscribers."""
+        save_config(self._config, self._path)
+        self.changed.emit()
+
+    def names(self) -> list[str]:
+        """Return preset names in stored order."""
+        return [m["name"] for m in self._config["materials"]]
+
+    def get(self, name: str) -> Optional[dict]:
+        """Look up a preset by exact name.
+
+        Args:
+            name: Preset name.
+
+        Returns:
+            A copy of the preset, or None if no such preset exists.
+        """
+        for material in self._config["materials"]:
+            if material["name"] == name:
+                return copy.deepcopy(material)
+        return None
+
+    def save(self, name: str, reference_values: dict, layer_count: int) -> bool:
+        """Create a preset or overwrite an existing one with the same name.
+
+        Args:
+            name: Preset name.
+            reference_values: Per-channel reference contrast in percent. Only
+                the channels present are recorded.
+            layer_count: Marked layer count for this material.
+
+        Returns:
+            True if the preset was stored.
+        """
+        material = _clean_material(
+            {
+                "name": name,
+                "reference_values": reference_values,
+                "layer_count": layer_count,
+            }
+        )
+        if material is None:
+            return False
+
+        for i, existing in enumerate(self._config["materials"]):
+            if existing["name"] == material["name"]:
+                self._config["materials"][i] = material
+                break
+        else:
+            self._config["materials"].append(material)
+
+        self._persist()
+        return True
+
+    def rename(self, old_name: str, new_name: str) -> bool:
+        """Rename a preset, refusing collisions with an existing name.
+
+        Args:
+            old_name: Current preset name.
+            new_name: Desired name.
+
+        Returns:
+            True if the rename happened.
+        """
+        new_name = new_name.strip()
+        if not new_name or new_name == old_name:
+            return False
+        if new_name in self.names():
+            return False
+        for material in self._config["materials"]:
+            if material["name"] == old_name:
+                material["name"] = new_name
+                # Announce the rename before `changed` so panels can follow it
+                # instead of seeing the old name vanish and clearing their
+                # selection.
+                self.renamed.emit(old_name, new_name)
+                self._persist()
+                return True
+        return False
+
+    def delete(self, name: str) -> bool:
+        """Remove a preset by name.
+
+        Args:
+            name: Preset name.
+
+        Returns:
+            True if a preset was removed.
+        """
+        for i, material in enumerate(self._config["materials"]):
+            if material["name"] == name:
+                del self._config["materials"][i]
+                self._persist()
+                return True
+        return False
+
+    def restore_builtins(self) -> int:
+        """Re-add built-in presets that are missing by name.
+
+        Existing presets are never overwritten, so an edited built-in keeps the
+        user's values.
+
+        Returns:
+            The number of presets added.
+        """
+        existing = set(self.names())
+        added = 0
+        for material in BUILTIN_MATERIALS:
+            if material["name"] not in existing:
+                self._config["materials"].append(copy.deepcopy(material))
+                added += 1
+        if added:
+            self._persist()
+        return added
+
+    def last_used(self) -> dict:
+        """Return a copy of the remembered panel/toolbar settings."""
+        return copy.deepcopy(self._config["last_used"])
+
+    def set_last_used(self, settings: dict):
+        """Persist the panel/toolbar settings to restore on the next launch.
+
+        Args:
+            settings: Settings dict, merged over the stored values.
+        """
+        merged = dict(self._config["last_used"])
+        merged.update(settings)
+        self._config["last_used"] = _clean_last_used(merged)
+        # Deliberately no `changed` emit: this is not preset data, and dropdowns
+        # have no reason to rebuild.
+        save_config(self._config, self._path)
 
 
 # =============================================================================
@@ -1304,6 +1750,134 @@ class MeasurementListItem(QWidget):
         self.remove_clicked.emit(self.index)
 
 
+class MaterialManagerDialog(QDialog):
+    """Rename, delete and restore material presets.
+
+    Preset *values* are not edited here: the workflow is to change the reference
+    values in the panel and save over the same name, so that saving stays an
+    explicit action.
+    """
+
+    def __init__(self, store: MaterialStore, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage Materials")
+        self.setMinimumWidth(340)
+        self._store = store
+
+        layout = QVBoxLayout(self)
+
+        hint = QLabel(
+            "To change a material's values, adjust them in the panel and save\n"
+            "over the same name."
+        )
+        hint.setStyleSheet("color: gray;")
+        layout.addWidget(hint)
+
+        self.list_widget = QListWidget()
+        self.list_widget.currentRowChanged.connect(self._update_button_states)
+        layout.addWidget(self.list_widget)
+
+        button_row = QHBoxLayout()
+        self.rename_btn = QPushButton("Rename…")
+        self.rename_btn.clicked.connect(self._on_rename)
+        button_row.addWidget(self.rename_btn)
+
+        self.delete_btn = QPushButton("Delete")
+        self.delete_btn.clicked.connect(self._on_delete)
+        button_row.addWidget(self.delete_btn)
+
+        self.restore_btn = QPushButton("Restore Built-ins")
+        self.restore_btn.setToolTip(
+            "Add back any built-in materials that are missing.\n"
+            "Existing materials are left untouched."
+        )
+        self.restore_btn.clicked.connect(self._on_restore)
+        button_row.addWidget(self.restore_btn)
+        layout.addLayout(button_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._reload()
+
+    def _reload(self):
+        """Refill the list from the store, preserving the selected name."""
+        previous = self._selected_name()
+        self.list_widget.clear()
+        names = self._store.names()
+        self.list_widget.addItems(names)
+        if previous in names:
+            self.list_widget.setCurrentRow(names.index(previous))
+        elif names:
+            self.list_widget.setCurrentRow(0)
+        self._update_button_states()
+
+    def _selected_name(self) -> Optional[str]:
+        """Return the highlighted material name, or None."""
+        item = self.list_widget.currentItem()
+        return item.text() if item is not None else None
+
+    def _update_button_states(self):
+        """Enable per-material actions only when something is selected."""
+        has_selection = self.list_widget.currentItem() is not None
+        self.rename_btn.setEnabled(has_selection)
+        self.delete_btn.setEnabled(has_selection)
+
+    def _on_rename(self):
+        """Prompt for a new name for the selected material."""
+        name = self._selected_name()
+        if name is None:
+            return
+        new_name, accepted = QInputDialog.getText(
+            self, "Rename Material", "New name:", text=name
+        )
+        if not accepted:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == name:
+            return
+        if not self._store.rename(name, new_name):
+            QMessageBox.warning(
+                self,
+                "Rename Material",
+                f'Could not rename to "{new_name}" - that name is already in use.',
+            )
+            return
+        self.list_widget.setCurrentRow(-1)
+        self._reload()
+        # Reselect under the new name.
+        names = self._store.names()
+        if new_name in names:
+            self.list_widget.setCurrentRow(names.index(new_name))
+
+    def _on_delete(self):
+        """Confirm and delete the selected material."""
+        name = self._selected_name()
+        if name is None:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Delete Material",
+            f'Delete the material "{name}"?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._store.delete(name)
+        self._reload()
+
+    def _on_restore(self):
+        """Add back any built-in materials that are missing."""
+        added = self._store.restore_builtins()
+        self._reload()
+        if added:
+            message = f"Added {added} built-in material(s)."
+        else:
+            message = "All built-in materials are already present."
+        QMessageBox.information(self, "Restore Built-ins", message)
+
+
 class DataDisplayPanel(QWidget):
     """Panel for displaying RGB contrast plots and measurement list."""
 
@@ -1311,19 +1885,25 @@ class DataDisplayPanel(QWidget):
     width_change_requested = Signal(int, int)  # (measurement_index, new_width)
     baseline_points_changed = Signal(int)  # Signal when baseline points changes
 
-    def __init__(self):
+    def __init__(self, store: Optional[MaterialStore] = None):
         super().__init__()
         self.measurements: list[Measurement] = []
+
+        # Shared material presets (owned by MainWindow, shared across tabs)
+        self._store = store
+        self._material_name: Optional[str] = None
+        self._material_dirty = False
 
         # Channel visibility state
         self.show_red = True
         self.show_green = True
         self.show_blue = False
 
-        # Y-axis limit settings (fraction units; plotting scales to %)
+        # Y-axis limit settings (fraction units; plotting scales to %).
+        # These mirror the toolbar defaults in MainWindow.
         self.use_fixed_yaxis = False
-        self.yaxis_min = -0.18
-        self.yaxis_max = 0.05
+        self.yaxis_min = -0.05
+        self.yaxis_max = 0.18
 
         # Number of points used for calculated reference-line baseline
         self.baseline_points = 25
@@ -1371,6 +1951,21 @@ class DataDisplayPanel(QWidget):
         )
         self.blue_checkbox.stateChanged.connect(self._on_channel_changed)
         channel_layout.addWidget(self.blue_checkbox)
+
+        # Material preset dropdown. Selecting a material fills in the reference
+        # values and marked layer below; it never saves on its own.
+        self.material_combo = QComboBox()
+        self.material_combo.setMinimumWidth(150)
+        self.material_combo.setToolTip(
+            "Material preset: fills in the reference values and marked layer.\n"
+            "An asterisk means the values have been changed since it was applied."
+        )
+        self.material_combo.activated.connect(self._on_material_activated)
+        channel_layout.addWidget(self.material_combo)
+        if self._store is not None:
+            self._store.changed.connect(self._rebuild_material_combo)
+            self._store.renamed.connect(self._on_material_renamed)
+        self._rebuild_material_combo()
 
         channel_layout.addStretch()
 
@@ -1435,7 +2030,7 @@ class DataDisplayPanel(QWidget):
         self.ref_green_spinbox = QDoubleSpinBox()
         self.ref_green_spinbox.setRange(-100.0, 100.0)
         self.ref_green_spinbox.setDecimals(2)
-        self.ref_green_spinbox.setSingleStep(2)
+        self.ref_green_spinbox.setSingleStep(0.15)
         self.ref_green_spinbox.setValue(self.reference_values["green"])
         self.ref_green_spinbox.setStyleSheet("QDoubleSpinBox { color: #008800; }")
         self.ref_green_spinbox.valueChanged.connect(
@@ -1503,6 +2098,190 @@ class DataDisplayPanel(QWidget):
         self.ref_blue_label.setVisible(self.show_blue)
         self.ref_blue_spinbox.setVisible(self.show_blue)
 
+    def _rebuild_material_combo(self):
+        """Regenerate the dropdown from the shared store.
+
+        Runs on construction and whenever any tab changes the store, so every
+        tab's dropdown stays in sync.
+        """
+        combo = self.material_combo
+        names = self._store.names() if self._store is not None else []
+
+        # A material deleted in another tab must not stay selected here.
+        if self._material_name is not None and self._material_name not in names:
+            self._material_name = None
+            self._material_dirty = False
+
+        combo.blockSignals(True)
+        combo.clear()
+        combo.setPlaceholderText("Material…")
+
+        selected_index = -1
+        for name in names:
+            if name == self._material_name and self._material_dirty:
+                label = f"{name} *"  # Values changed since the preset was applied
+            else:
+                label = name
+            combo.addItem(label, ("material", name))
+            if name == self._material_name:
+                selected_index = combo.count() - 1
+
+        if names:
+            combo.insertSeparator(combo.count())
+        combo.addItem("Save current settings as…", ("action", "save"))
+        combo.addItem("Manage materials…", ("action", "manage"))
+
+        combo.setCurrentIndex(selected_index)
+        combo.blockSignals(False)
+
+    def _on_material_renamed(self, old_name: str, new_name: str):
+        """Follow a rename so a selected material stays selected.
+
+        Args:
+            old_name: The preset's previous name.
+            new_name: The preset's new name.
+        """
+        if self._material_name == old_name:
+            self._material_name = new_name
+
+    def _on_material_activated(self, index: int):
+        """Handle a user selection in the material dropdown.
+
+        Args:
+            index: Index of the activated combo entry.
+        """
+        data = self.material_combo.itemData(index)
+        if not data:
+            return
+        kind, value = data
+        if kind == "material":
+            self._apply_material(value)
+            return
+
+        # Restore the previous selection before opening anything, so the combo
+        # never sticks on an action entry.
+        self._rebuild_material_combo()
+        if value == "save":
+            self._save_current_material()
+        elif value == "manage":
+            self._open_material_manager()
+
+    def _apply_material(self, name: str):
+        """Populate the reference settings from a material preset.
+
+        Channels the preset does not mention are left alone. Widget signals are
+        blocked so this costs a single plot redraw instead of one per spinbox.
+
+        Args:
+            name: Preset name to apply.
+        """
+        if self._store is None:
+            return
+        material = self._store.get(name)
+        if material is None:
+            return
+
+        spinboxes = {
+            "red": self.ref_red_spinbox,
+            "green": self.ref_green_spinbox,
+            "blue": self.ref_blue_spinbox,
+        }
+        for channel, spinbox in spinboxes.items():
+            if channel not in material["reference_values"]:
+                continue
+            spinbox.blockSignals(True)
+            spinbox.setValue(material["reference_values"][channel])
+            spinbox.blockSignals(False)
+            # Read back so spinbox clamping and rounding win.
+            self.reference_values[channel] = spinbox.value()
+
+        self.layer_spinbox.blockSignals(True)
+        self.layer_spinbox.setValue(material["layer_count"])
+        self.layer_spinbox.blockSignals(False)
+        self.layer_count = self.layer_spinbox.value()
+
+        self._material_name = name
+        self._material_dirty = False
+        self._rebuild_material_combo()
+        self._update_plots()
+
+    def _mark_material_dirty(self):
+        """Flag that the reference settings no longer match the applied preset."""
+        if self._material_name is not None and not self._material_dirty:
+            self._material_dirty = True
+            self._rebuild_material_combo()
+
+    def _visible_reference_values(self) -> dict:
+        """Return reference values for the enabled channels only.
+
+        A preset records only what it knows about, so a hidden channel's
+        spinbox value is not captured.
+
+        Returns:
+            Mapping of channel name to reference contrast in percent.
+        """
+        visible = {
+            "red": self.show_red,
+            "green": self.show_green,
+            "blue": self.show_blue,
+        }
+        return {
+            channel: self.reference_values[channel]
+            for channel in CHANNEL_NAMES
+            if visible[channel]
+        }
+
+    def _save_current_material(self):
+        """Save the current reference settings as a named material preset."""
+        if self._store is None:
+            return
+
+        values = self._visible_reference_values()
+        if not values:
+            QMessageBox.warning(
+                self,
+                "Save Material",
+                "Enable at least one channel before saving a material.",
+            )
+            return
+
+        name, accepted = QInputDialog.getText(
+            self,
+            "Save Material",
+            "Material name:",
+            text=self._material_name or "",
+        )
+        if not accepted:
+            return
+        name = name.strip()
+        if not name:
+            return
+
+        if name in self._store.names():
+            reply = QMessageBox.question(
+                self,
+                "Overwrite Material",
+                f'"{name}" already exists. Overwrite it?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        if self._store.save(name, values, self.layer_count):
+            self._material_name = name
+            self._material_dirty = False
+            # The store's `changed` signal already rebuilt the combo, but it did
+            # so before the selection above was recorded.
+            self._rebuild_material_combo()
+
+    def _open_material_manager(self):
+        """Open the rename/delete/restore dialog for material presets."""
+        if self._store is None:
+            return
+        dialog = MaterialManagerDialog(self._store, self)
+        dialog.exec()
+        self._rebuild_material_combo()
+
     def _on_baseline_points_changed(self, value: int):
         """Handle baseline points spinbox changes."""
         self.baseline_points = value
@@ -1521,11 +2300,13 @@ class DataDisplayPanel(QWidget):
     def _on_layer_count_changed(self, value: int):
         """Handle layer count spinbox changes."""
         self.layer_count = value
+        self._mark_material_dirty()
         self._update_plots()
 
     def _on_ref_value_changed(self, channel: str, value: float):
         """Handle reference value spinbox changes for a specific channel."""
         self.reference_values[channel] = value
+        self._mark_material_dirty()
         self._update_plots()
 
     def _on_mouse_press(self, event):
@@ -1572,6 +2353,7 @@ class DataDisplayPanel(QWidget):
             ref_value = spinbox.value()
             spinbox.blockSignals(False)
         self.reference_values[self._drag_channel] = ref_value
+        self._mark_material_dirty()
         self._update_plots()
 
     def _setup_plots(self):
@@ -1611,29 +2393,24 @@ class DataDisplayPanel(QWidget):
             ax.set_xlabel("Pixels")
             ax.set_ylabel("Contrast (%)", color=color, fontweight="bold")
             ax.tick_params(axis="y", labelcolor=color)
-            ax.grid(True, alpha=0.3)
-            ax.axhline(y=0, color="gray", linestyle="-", linewidth=0.5)
+            # Grid is faint dotted chrome behind the data; the zero line is a
+            # solid neutral rule above the grid but below the traces.
+            ax.set_axisbelow(True)
+            ax.grid(True, color=GRID_COLOR, linestyle=":", linewidth=0.6, alpha=0.9)
+            ax.axhline(
+                y=0, color=ZERO_LINE_COLOR, linestyle="-", linewidth=0.8, zorder=1.5
+            )
             # Increase number of tick marks
             ax.yaxis.set_major_locator(MaxNLocator(nbins=10))
-            # Format ticks as percent
-            ax.yaxis.set_major_formatter(FuncFormatter(lambda y, pos: f"{y:.0f}%"))
+            # Format ticks as percent. decimals=None lets the formatter pick its
+            # precision from the axis range, so a 2.5-point tick step reads
+            # "2.5%" instead of rounding several ticks to the same "2%".
+            ax.yaxis.set_major_formatter(PercentFormatter(xmax=100, decimals=None))
             axes[color] = ax
             self._axes_map[ax] = color  # Map axis to channel name
 
         # Use tight_layout with padding to prevent overlap
         self.figure.tight_layout(pad=1.0, h_pad=1.5)
-
-        if self.use_calculated_ref_baseline:
-            self.figure.text(
-                0.02,
-                0.03,
-                "(Reference lines use calculated baseline)",
-                fontsize=8,
-                color="gray",
-                style="italic",
-                ha="left",
-                va="bottom",
-            )
 
         return axes
 
@@ -1643,6 +2420,94 @@ class DataDisplayPanel(QWidget):
         self.measurements.append(measurement)
         self._update_plots()
         self._update_list()
+
+    def get_settings(self) -> dict:
+        """Capture the panel's user-adjustable state.
+
+        Used to seed new tabs and to remember settings between launches.
+        Measurement data is not included.
+
+        Returns:
+            A settings dict accepted by apply_settings().
+        """
+        return {
+            "show_red": self.show_red,
+            "show_green": self.show_green,
+            "show_blue": self.show_blue,
+            "baseline_points": self.baseline_points,
+            "use_calculated_ref_baseline": self.use_calculated_ref_baseline,
+            "show_ref_lines": self.show_ref_lines,
+            "layer_count": self.layer_count,
+            "reference_values": dict(self.reference_values),
+            "material": self._material_name,
+        }
+
+    def apply_settings(self, settings: Optional[dict]):
+        """Apply a settings dict produced by get_settings().
+
+        Every widget is updated with its signals blocked, so this costs one
+        plot redraw rather than one per control.
+
+        Args:
+            settings: Settings to apply. Missing keys keep their current value;
+                None is a no-op.
+        """
+        if not settings:
+            return
+
+        checkboxes = {
+            "show_red": (self.red_checkbox, "show_red"),
+            "show_green": (self.green_checkbox, "show_green"),
+            "show_blue": (self.blue_checkbox, "show_blue"),
+            "show_ref_lines": (self.ref_enable_checkbox, "show_ref_lines"),
+            "use_calculated_ref_baseline": (
+                self.ref_baseline_checkbox,
+                "use_calculated_ref_baseline",
+            ),
+        }
+        for key, (checkbox, attr) in checkboxes.items():
+            if key in settings:
+                value = bool(settings[key])
+                checkbox.blockSignals(True)
+                checkbox.setChecked(value)
+                checkbox.blockSignals(False)
+                setattr(self, attr, value)
+
+        spinboxes = [
+            ("baseline_points", self.baseline_spinbox, "baseline_points"),
+            ("layer_count", self.layer_spinbox, "layer_count"),
+        ]
+        for key, spinbox, attr in spinboxes:
+            if key in settings:
+                spinbox.blockSignals(True)
+                spinbox.setValue(settings[key])
+                spinbox.blockSignals(False)
+                # Read back so spinbox range clamping wins.
+                setattr(self, attr, spinbox.value())
+
+        ref_spinboxes = {
+            "red": self.ref_red_spinbox,
+            "green": self.ref_green_spinbox,
+            "blue": self.ref_blue_spinbox,
+        }
+        reference_values = settings.get("reference_values")
+        if isinstance(reference_values, dict):
+            for channel, spinbox in ref_spinboxes.items():
+                if channel not in reference_values:
+                    continue
+                spinbox.blockSignals(True)
+                spinbox.setValue(reference_values[channel])
+                spinbox.blockSignals(False)
+                self.reference_values[channel] = spinbox.value()
+
+        if "material" in settings:
+            material = settings["material"]
+            self._material_name = material if isinstance(material, str) else None
+            self._material_dirty = False
+
+        self._rebuild_material_combo()
+        self._update_ref_visibility()
+        self._update_plots()
 
     def set_yaxis_limits(self, use_fixed: bool, y_min: float, y_max: float):
         """Set Y-axis limit parameters and refresh plots."""
@@ -1764,8 +2629,38 @@ class DataDisplayPanel(QWidget):
 
         for channel, ax in axes.items():
             baseline = self._get_reference_baseline(channel)
+            # Always record the baseline; reference-line dragging hit-tests against it.
             self._reference_baselines[channel] = baseline
-            ax.axhline(y=baseline, color="gray", linestyle="-", linewidth=1)
+            # Only draw it when it carries information. With "Calc Baseline" off the
+            # baseline is 0, and drawing it would just overdraw the zero line.
+            if self.use_calculated_ref_baseline:
+                ax.axhline(
+                    y=baseline,
+                    color=BASELINE_COLOR,
+                    linestyle="--",
+                    linewidth=1.4,
+                    alpha=0.95,
+                    zorder=3,
+                )
+                # Pin the label to the right edge (axes coords) while tracking the
+                # baseline value (data coords). The delta labels sit on the left.
+                ax.text(
+                    0.995,
+                    baseline,
+                    "baseline",
+                    transform=blended_transform_factory(ax.transAxes, ax.transData),
+                    color=BASELINE_COLOR,
+                    fontsize=7,
+                    ha="right",
+                    va="bottom",
+                    zorder=3,
+                    bbox={
+                        "facecolor": "white",
+                        "edgecolor": "none",
+                        "alpha": 0.75,
+                        "boxstyle": "round,pad=0.15",
+                    },
+                )
             ref_val = self.reference_values.get(channel, -10.0)
             main_ref_line = baseline + ref_val
             y_min, y_max = ax.get_ylim()
@@ -1885,7 +2780,13 @@ class DataDisplayPanel(QWidget):
 class ImageTab(QWidget):
     """Tab containing image canvas and data display for one captured image."""
 
-    def __init__(self, pixmap: QPixmap, pil_image: Image.Image):
+    def __init__(
+        self,
+        pixmap: QPixmap,
+        pil_image: Image.Image,
+        store: Optional[MaterialStore] = None,
+        settings: Optional[dict] = None,
+    ):
         super().__init__()
         self.data = ImageData(pixmap=pixmap, pil_image=pil_image)
 
@@ -1905,12 +2806,13 @@ class ImageTab(QWidget):
         splitter.addWidget(self.canvas)
 
         # Data display
-        self.data_panel = DataDisplayPanel()
+        self.data_panel = DataDisplayPanel(store=store)
         self.data_panel.measurement_removed.connect(self._on_measurement_removed)
         self.data_panel.width_change_requested.connect(self._on_width_change_requested)
         self.data_panel.baseline_points_changed.connect(
             self._on_baseline_points_changed
         )
+        self.data_panel.apply_settings(settings)
         splitter.addWidget(self.data_panel)
 
         splitter.setSizes([500, 400])
@@ -2032,9 +2934,9 @@ class ImageTab(QWidget):
 class MainWindow(QMainWindow):
     """Main application window."""
 
-    def __init__(self):
+    def __init__(self, config_path: Optional[Path] = None):
         super().__init__()
-        self.setWindowTitle("Optical Flake Thickness Characterizer V0.4.2")
+        self.setWindowTitle(f"Optical Flake Thickness Characterizer {APP_VERSION}")
         # macOS Split View requires the app window to be resizable to about half-screen.
         if sys.platform == "darwin":
             self.setMinimumSize(700, 500)
@@ -2043,6 +2945,13 @@ class MainWindow(QMainWindow):
 
         # Track selection mode state
         self._in_selection_mode = False
+
+        # Persisted material presets and last-used settings. Loading never
+        # raises, so a corrupt config degrades to defaults.
+        self._config_path = config_path
+        self._config = load_config(config_path)
+        self.material_store = MaterialStore(self._config, config_path)
+        self._last_used_settings = self.material_store.last_used()
 
         # Central widget
         central = QWidget()
@@ -2099,7 +3008,7 @@ class MainWindow(QMainWindow):
         self.toolbar.addWidget(self.width_label)
         self.width_input = QSpinBox()
         self.width_input.setRange(1, 999)
-        self.width_input.setValue(20)
+        self.width_input.setValue(self._last_used_settings["linecut_width"])
         self.width_input.setToolTip("Averaging width for linecut")
         self.toolbar.addWidget(self.width_input)
 
@@ -2107,7 +3016,7 @@ class MainWindow(QMainWindow):
 
         # Y-axis controls
         self.yaxis_checkbox = QCheckBox(" Fixed Y-Axis")
-        self.yaxis_checkbox.setChecked(False)
+        self.yaxis_checkbox.setChecked(self._last_used_settings["use_fixed_yaxis"])
         self.yaxis_checkbox.setToolTip("Use fixed Y-axis limits across all plots")
         self.yaxis_checkbox.stateChanged.connect(self._on_yaxis_settings_changed)
         self.toolbar.addWidget(self.yaxis_checkbox)
@@ -2116,7 +3025,7 @@ class MainWindow(QMainWindow):
         self.toolbar.addWidget(self.yaxis_min_label)
         self.yaxis_min_input = QDoubleSpinBox()
         self.yaxis_min_input.setRange(-10.0, 10.0)
-        self.yaxis_min_input.setValue(-0.05)
+        self.yaxis_min_input.setValue(self._last_used_settings["yaxis_min"])
         self.yaxis_min_input.setSingleStep(0.105)
         self.yaxis_min_input.setDecimals(2)
         self.yaxis_min_input.setToolTip("Minimum Y-axis value")
@@ -2127,7 +3036,7 @@ class MainWindow(QMainWindow):
         self.toolbar.addWidget(self.yaxis_max_label)
         self.yaxis_max_input = QDoubleSpinBox()
         self.yaxis_max_input.setRange(-10.0, 10.0)
-        self.yaxis_max_input.setValue(0.18)
+        self.yaxis_max_input.setValue(self._last_used_settings["yaxis_max"])
         self.yaxis_max_input.setSingleStep(0.05)
         self.yaxis_max_input.setDecimals(2)
         self.yaxis_max_input.setToolTip("Maximum Y-axis value")
@@ -2156,6 +3065,13 @@ class MainWindow(QMainWindow):
 
         # Capture overlay reference
         self.capture_overlay: Optional[ScreenCaptureOverlay] = None
+
+        # Cmd+Q on macOS can quit without delivering a close event, so hook the
+        # application's own shutdown as well. Qt drops this connection when the
+        # window is destroyed.
+        instance = QApplication.instance()
+        if instance is not None:
+            instance.aboutToQuit.connect(self._save_last_used)
 
     def _start_capture(self):
         """Start screen capture mode."""
@@ -2259,8 +3175,19 @@ class MainWindow(QMainWindow):
     def _create_tab_from_capture(self, pixmap: QPixmap, pil_image: Image.Image):
         """Create a new image tab from captured image data."""
 
+        # Inherit from the tab that was active when Capture was pressed. Read it
+        # before the new tab is added, and fall back to the previous session's
+        # settings when this is the first tab.
+        source = self._current_tab()
+        if source is not None:
+            inherited = source.data_panel.get_settings()
+        else:
+            inherited = self._last_used_settings
+
         # Create new tab
-        tab = ImageTab(pixmap, pil_image)
+        tab = ImageTab(
+            pixmap, pil_image, store=self.material_store, settings=inherited
+        )
         tab.drawing_mode_changed.connect(self._on_drawing_mode_changed)
 
         # Apply current Y-axis settings to new tab
@@ -2274,6 +3201,29 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(index)
 
         self._update_button_states()
+        self._save_last_used()
+
+    def _save_last_used(self):
+        """Remember the active tab's panel settings and the toolbar state."""
+        settings = dict(self._last_used_settings)
+        tab = self._current_tab()
+        if tab is not None:
+            settings.update(tab.data_panel.get_settings())
+        settings.update(
+            {
+                "use_fixed_yaxis": self.yaxis_checkbox.isChecked(),
+                "yaxis_min": self.yaxis_min_input.value(),
+                "yaxis_max": self.yaxis_max_input.value(),
+                "linecut_width": self.width_input.value(),
+            }
+        )
+        self._last_used_settings = settings
+        self.material_store.set_last_used(settings)
+
+    def closeEvent(self, event):
+        """Persist the current settings before the window closes."""
+        self._save_last_used()
+        super().closeEvent(event)
 
     def _on_capture_cancelled(self):
         """Handle cancelled capture."""

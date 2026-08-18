@@ -12,19 +12,21 @@ smoke test is not. Do not build on a red smoke test unless the user says to.
 
 ## Bumping the version
 
-The version string is duplicated in four places and they drift. When bumping, change all of
-them in the same edit:
+The version lives in one place: `APP_VERSION` near the top of `opticalFlake.py`. Editing
+that line is the bump. The window title interpolates it, and `build_app.py` parses the
+literal out of the source (`read_app_version`) to name the bundle, so the two cannot drift.
 
-1. `build_app.py` → `APP_VERSION = "V0.4.2"` (drives the bundle name and `MAIN_SCRIPT`)
-2. `opticalFlake_V0.4.py` → `MainWindow.__init__` window title
-3. `README.md` → the download and run instructions
-4. The source filename itself, if you are renaming it (`git mv`, don't copy — the repo
-   already carries one abandoned rename)
+Two things do not follow automatically:
 
-`build_app.py` looks for `opticalFlake_{APP_VERSION}.py`, and when that file is missing it
-falls back to the highest-numbered `opticalFlake_V*.py` and prints a warning. That warning
-is the signal that items 1 and 4 disagree. Read the build output rather than assuming it
-picked the file you meant.
+1. `README.md` → the `OpticalFlake_V<version>` download names under Quick Start and the
+   build output paths. `tools/smoke_test.py::test_version` fails when the README no longer
+   mentions the current version, so a forgotten update shows up as a red check.
+2. The source filename is deliberately version-free (`opticalFlake.py`). Do not put the
+   version back into it — that is what used to drift.
+
+`build_app.py` builds exactly `opticalFlake.py` and raises `FileNotFoundError` if it is
+missing; it never substitutes another script. Read the `Source:` line it prints to confirm
+the version it picked up.
 
 ## Building
 

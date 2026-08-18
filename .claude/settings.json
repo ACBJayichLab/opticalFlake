@@ -24,7 +24,7 @@
     ],
     "ask": [
       "Bash(.venv/bin/python build_app.py)",
-      "Bash(.venv/bin/python opticalFlake_V0.4.py)"
+      "Bash(.venv/bin/python opticalFlake.py)"
     ],
     "deny": [
       "Edit(./Old_Versions/**)",

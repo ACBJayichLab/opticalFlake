@@ -7,7 +7,7 @@ substrate background region, and draws linecuts; the app plots per-channel RGB c
 ## Commands
 
 ```bash
-.venv/bin/python opticalFlake_V0.4.py      # run the app (GUI, needs a real display)
+.venv/bin/python opticalFlake.py      # run the app (GUI, needs a real display)
 .venv/bin/python tools/smoke_test.py       # headless checks — run this after every edit
 .venv/bin/python build_app.py              # PyInstaller bundle into dist/ — see /build-release
 ```
@@ -28,7 +28,7 @@ that the check was visual — or ask the user to confirm.
 
 ## Architecture
 
-Single file, `opticalFlake_V0.4.py` (~2400 lines), divided by `# ===` banner comments:
+Single file, `opticalFlake.py` (~2400 lines), divided by `# ===` banner comments:
 Data Models → Calculation Functions → Screen Capture Overlay → Image Canvas → Data Display
 Panel → Image Tab → Main Window → Entry Point.
 
@@ -92,10 +92,13 @@ update both sides.
 blocks forever without a user, which is why the smoke test stubs it. Prefer the existing
 `invalid_action` signal over adding new modals.
 
-**Versions drift between files.** `build_app.py` sets `APP_VERSION = "V0.4.2"` and the
-window title says V0.4.2, but the source file is `opticalFlake_V0.4.py`; the build falls
-back to the newest `opticalFlake_V*.py` and prints a warning. Bumping a version means
-editing four places at once — use the `build-release` skill, which lists them.
+**The version is written in exactly one place.** `APP_VERSION` near the top of
+`opticalFlake.py` drives the window title; `build_app.py` parses that literal out of the
+source (`read_app_version`) to name the bundle, and has no copy of its own. The source
+filename carries no version, and the build hard-fails if `opticalFlake.py` is missing
+rather than substituting another script. `tools/smoke_test.py::test_version` fails if the
+app, the build script and the README disagree, so a bump is one line plus the README
+download names — see the `build-release` skill.
 
 ## Conventions
 

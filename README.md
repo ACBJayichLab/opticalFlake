@@ -18,13 +18,13 @@ Desktop tool for optical flake thickness characterization in materials science. 
 ## Quick Start (Standalone App)
 
 ### macOS
-1. Download `OpticalFlake_V0.4` from the [releases](../../releases)
+1. Download `OpticalFlake_V0.5.0` from the [releases](../../releases)
 2. Move to Applications folder
 3. On first run, grant **Screen Recording** permission:
    - System Settings → Privacy & Security → Screen Recording → Add OpticalFlake
 
 ### Windows
-1. Download `OpticalFlake_V0.4.exe` from the [releases](../../releases)
+1. Download `OpticalFlake_V0.5.0.exe` from the [releases](../../releases)
 2. Run the executable
 
 ## Development Setup
@@ -58,7 +58,7 @@ pip install -r requirements.txt
 
 ```bash
 source .venv/bin/activate  # or .venv\Scripts\activate on Windows
-python opticalFlake_V0.4.py
+python opticalFlake.py
 ```
 
 ### Build Standalone Application
@@ -68,8 +68,11 @@ python build_app.py
 ```
 
 This creates:
-- **macOS**: `dist/OpticalFlake_V0.4` (executable)
-- **Windows**: `dist/OpticalFlake_V0.4.exe`
+- **macOS**: `dist/OpticalFlake_V0.5.0.app` (bundle) plus a plain executable
+- **Windows**: `dist/OpticalFlake_V0.5.0.exe`
+
+The version in the bundle name comes from `APP_VERSION` in `opticalFlake.py`, which is
+the only place it is written.
 
 ## Usage
 
@@ -98,9 +101,10 @@ This creates:
 
 ```
 opticalFlake/
-├── opticalFlake_V0.4.py   # Main application
+├── opticalFlake.py        # Main application (APP_VERSION lives here)
 ├── build_app.py           # PyInstaller build script
 ├── requirements.txt       # Python dependencies
+├── tools/smoke_test.py    # Headless checks
 ├── Old_Versions/          # Previous versions
 └── dist/                  # Built executables (after build)
 ```
